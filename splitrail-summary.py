@@ -72,10 +72,14 @@ def fetch_claude_quota():
         return {"error": "找不到 Claude 憑證（~/.claude/.credentials.json）"}
     if oauth.get("expiresAt") and time.time() * 1000 > oauth["expiresAt"]:
         return {"error": "Claude token 已過期，在終端機執行一次 claude 指令即可刷新"}
-    req = urllib.request.Request(
-        "https://api.anthropic.com/api/oauth/usage",
-        headers={"Authorization": "Bearer " + token, "anthropic-beta": "oauth-2025-04-20"},
-    )
+    headers = {
+        "Authorization": "Bearer " + token,
+        "anthropic-beta": "oauth-2025-04-20",
+        # 額度重置券（cedar_ember）只回給 Claude Code 這個來源，其他 User-Agent 會得到
+        # eligible:false, ineligible_reason:"surface"（2026-09-27 實測；OpenUsage 同樣寫死版本號）
+        "User-Agent": "claude-cli/2.1.283 (external, cli)",
+    }
+    req = urllib.request.Request("https://api.anthropic.com/api/oauth/usage?cedar_ember=1", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.load(resp)
@@ -91,7 +95,56 @@ def fetch_claude_quota():
         windows.append({"label": label, "pct": w["utilization"], "resets_at": w.get("resets_at"), "secs": secs})
     if not windows:
         return {"error": "額度 API 回應中沒有 5 小時／每週額度資料"}
-    return {"windows": windows}
+    return {"windows": windows, "grants": parse_claude_reset_grants(data.get("cedar_ember")),
+            "plan": fetch_claude_plan(headers, oauth.get("subscriptionType"), oauth.get("rateLimitTier"))}
+
+
+def parse_claude_reset_grants(block):
+    """額度重置券（Anthropic 偶爾贈送，可清空 5 小時／每週窗）。沒有這個區塊回傳 None；
+
+    不符資格算 0 張；已過期或用完的券略過（同 OpenUsage 的判斷）。
+    """
+    if not isinstance(block, dict):
+        return None
+    items = []
+    if block.get("eligible"):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        for g in block.get("grants") or []:
+            left = int(g.get("resets_left") or 0)
+            ends_at = g.get("ends_at")
+            if left < 1:
+                continue
+            try:
+                if ends_at and datetime.datetime.fromisoformat(ends_at) <= now:
+                    continue
+            except ValueError:
+                pass
+            items.append({"label": g.get("label") or g.get("id") or "額度重置", "left": left,
+                          "ends_at": ends_at, "usable_now": bool(g.get("usable_now"))})
+    return {"count": sum(i["left"] for i in items), "items": items}
+
+
+def format_claude_plan(org_type, tier):
+    """claude_max + default_claude_max_20x → "Max 20x"；claude_pro → "Pro"。"""
+    if not org_type:
+        return None
+    name = org_type.removeprefix("claude_").replace("_", " ").title()
+    m = re.search(r"\d+x", tier or "")
+    return f"{name} {m.group(0)}" if m else name
+
+
+def fetch_claude_plan(headers, stored_type, stored_tier):
+    """方案名稱以即時 profile 為準（升級後不用重新登入就會更新）；查不到就退回憑證檔裡登入當時的方案。"""
+    req = urllib.request.Request("https://api.anthropic.com/api/oauth/profile", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            org = json.load(resp).get("organization") or {}
+        plan = format_claude_plan(org.get("organization_type"), org.get("rate_limit_tier"))
+        if plan:
+            return plan
+    except (urllib.error.URLError, OSError, ValueError, AttributeError):
+        pass
+    return format_claude_plan(f"claude_{stored_type}" if stored_type else None, stored_tier)
 
 
 def window_label(seconds):
@@ -450,7 +503,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .token-cached { color: #6C7079; font-weight: 400; margin-left: 6px; }
   .track { background: #2C2F38; border-radius: 6px; height: 6px; overflow: hidden; display: flex; position: relative; }
   .track .seg { height: 100%; flex: none; }
-  .track .seg.cached { opacity: .35; }
+  .track .seg.cached { opacity: .55; }
   .prov-head { display: flex; align-items: center; font-size: 15px; font-weight: 600; margin-bottom: 12px; }
   .meter { font-size: 12px; margin-bottom: 12px; }
   .meter-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 5px; }
@@ -486,6 +539,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .pm-sub { color: #9AA0AC; font-size: 11px; margin: 1px 0 3px; }
   .pm .track { height: 3px; }
   .hint { font-size: 11px; color: #6C7079; margin-top: 8px; }
+  .plan {
+    margin-left: 8px; padding: 1px 7px; border-radius: 6px; background: #2C2F38;
+    color: #9AA0AC; font-size: 11px; font-weight: 500;
+  }
+  .grants { margin-top: 6px; padding-top: 8px; border-top: 1px solid #33363F; }
   .footer { font-size: 11px; color: #6C7079; text-align: center; padding: 2px 0 8px; }
 </style>
 </head>
@@ -666,7 +724,11 @@ function renderTokens() {
 function pace(w, now) {
   const u = Math.min(100, Math.max(0, w.pct));
   const reset = w.resets_at ? Math.round(new Date(w.resets_at) / 60000) * 60000 : null;
-  const notStarted = w.not_started || (u === 0 && !reset);
+  // 短窗（5 小時）用量 0% 時，閒置的回應可能是：沒有重置時間、重置時間已過、或重置時間＝現在＋整個窗長
+  // （Codex/Antigravity 實測是第三種；Claude 閒置時是哪種尚未觀察到，三種都當成尚未開始）
+  const shortWin = w.secs && w.secs < 604800;
+  const notStarted = w.not_started || (u === 0 && (!reset ||
+    (shortWin && (reset <= now || reset - now >= w.secs * 1000 - 120000))));
   const r = { u, color: BLUE, note: "", noteColor: "", tick: null, hover: "" };
   if (notStarted) r.resetText = "尚未開始（送出第一則訊息後才開始計時）";
   else if (!reset) r.resetText = "重置時間未知";
@@ -774,6 +836,18 @@ function spendRowsHtml(p) {
   }).join("");
 }
 
+// 額度重置券：顯示可用張數，滑鼠移上看每張的內容與期限（同 OpenUsage 的 Rate Limit Resets，唯讀）
+function grantsHtml(p) {
+  const g = p.quota && p.quota.grants;
+  if (!g) return "";
+  const pop = g.items.length ? `<div class="popover">` + g.items.map(it => `<div class="pm">
+      <div class="pm-line"><span class="pm-name">${esc(it.label)}</span><span>×${it.left}</span></div>
+      <div class="pm-sub">${it.ends_at ? "期限 " + fmtAt(it.ends_at) : "無期限"}${it.usable_now ? " · 現在可用" : ""}</div></div>`).join("") +
+    `<div class="pm-sub">在 Claude Code 執行 /rate-limit-options 使用</div></div>` : "";
+  return `<div class="grants"><div class="spend-row${pop ? " has-models" : ""}"><span class="row-name">額度重置券</span>
+    <span class="row-nums${g.count ? "" : " nodata"}">${g.count} 張可用</span>${pop}</div></div>`;
+}
+
 const meterEls = [];
 function renderProviders() {
   const wrap = document.getElementById("providerCards");
@@ -783,13 +857,14 @@ function renderProviders() {
     const hint = p.name === "Antigravity CLI"
       ? `<div class="hint">Antigravity 的花費受 splitrail 本身的 bug 影響，數字偏低。</div>` : "";
     card.innerHTML = `
-      <div class="prov-head"><span class="dot" style="background:${p.color}"></span>${esc(p.name)}</div>
+      <div class="prov-head"><span class="dot" style="background:${p.color}"></span>${esc(p.name)}${
+        p.quota && p.quota.plan ? `<span class="plan">${esc(p.quota.plan)}</span>` : ""}</div>
       <div class="meters"></div>
       ${trendHtml(p)}
       <button class="caret" data-expand="prov${i}"><span>顯示更多</span><span class="chev">▾</span></button>
       <div class="expand" data-panel="prov${i}">
         <div class="sub-title">花費（splitrail 估算，滑鼠移到數字上看分模型明細）</div>
-        ${spendRowsHtml(p)}${hint}
+        ${spendRowsHtml(p)}${grantsHtml(p)}${hint}
       </div>`;
     wrap.appendChild(card);
     meterEls.push([card.querySelector(".meters"), p]);
