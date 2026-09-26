@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+splitrail.exe
+splitrail-dashboard.html
