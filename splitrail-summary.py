@@ -570,8 +570,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     .grants { margin-top: 4px; padding-top: 4px; }
     .hint { margin-top: 4px; }
     .token-list { gap: 6px; }
-    .trend { flex: 1; display: flex; flex-direction: column; min-height: 44px; }
+    .trend { flex: 1; display: flex; flex-direction: column; min-height: 44px; max-height: 160px; margin-bottom: 8px; }
     .trend svg { flex: 1; height: auto; min-height: 24px; }
+    .card > .expand { margin-top: auto; }  /* 趨勢圖到頂後多出的空間放在花費區上方，各卡花費區貼底對齊 */
+    .expand .spend-row { font-size: 14px; padding: 5px 6px; }
+    .expand .sub-title { font-size: 12px; }
     #spendCard .donut-row { flex: 1; min-height: 120px; gap: 14px; }
     #spendCard .donut-wrap { width: clamp(110px, 24vh, 190px); height: clamp(110px, 24vh, 190px); }
     #spendCard .donut-wrap svg { width: 100%; height: 100%; }
