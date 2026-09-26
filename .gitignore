@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 splitrail.exe
 splitrail-dashboard.html
+
+# 本機驗證過程產物（截圖、一次性腳本）
+_驗證過程/

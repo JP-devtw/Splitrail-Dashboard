@@ -1,8 +1,13 @@
 # Splitrail Dashboard
 
 彙總 Claude Code／Codex CLI／Antigravity CLI 三家 AI coding 工具的用量，產出仿
-[OpenUsage](https://www.openusage.ai/) 風格的視覺化網頁（甜甜圈圖 + Today/Yesterday/30
-Days 頁籤 + token 用量長條圖）。
+[OpenUsage](https://www.openusage.ai/) 風格的視覺化網頁：總花費甜甜圈（可切換 Cost／Cost per
+MTok／Tokens）、每家的訂閱額度條（5 小時／每週，含重置倒數與 pace 預估）、近 30 天用量趨勢、
+分模型花費明細。
+
+訂閱額度直接查官方用量 API，不經過 splitrail：Claude 用 Claude Code CLI 的
+`~/.claude/.credentials.json`、Codex 用 `~/.codex/auth.json`（token 過期時卡片會提示，在終端機
+跑一次該 CLI 即可刷新）；Antigravity 只在 App 或 `agy` 執行中才抓得到。
 
 費用是用本機 token 記錄反推的**估算值**，不是官方帳單金額，只拿來看相對趨勢，
 對帳請以官方帳單為準。Antigravity CLI 的用量目前因上游 [splitrail](https://github.com/Piebald-AI/splitrail)
@@ -29,8 +34,8 @@ Days 頁籤 + token 用量長條圖）。
 
 ## 背景自動更新（選用）
 
-`splitrail-dashboard-loop.bat` 是一個無窮迴圈，每 15 分鐘呼叫一次
-`splitrail-dashboard.bat --no-open` 靜默更新網頁。
+`splitrail-dashboard-loop.bat` 是一個無窮迴圈，每 5 分鐘呼叫一次
+`splitrail-dashboard.bat --no-open` 靜默更新網頁；開著的網頁也會每 5 分鐘自動重新載入。
 
 若想「開機/登入時自動啟動」但沒有系統管理員權限（無法用工作排程器 Task Scheduler）：
 把一個呼叫 `start /min "" "<這個資料夾路徑>\splitrail-dashboard-loop.bat"` 的
