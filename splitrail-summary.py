@@ -545,6 +545,40 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
   .grants { margin-top: 6px; padding-top: 8px; border-top: 1px solid #33363F; }
   .footer { font-size: 11px; color: #6C7079; text-align: center; padding: 2px 0 8px; }
+  /* 寬螢幕一頁呈現：左欄總花費，右邊每家工具一欄；窄螢幕維持單欄 */
+  /* 卡片撐滿視窗高度、收合內容直接展開，趨勢圖吃掉剩餘高度；內容超過一頁時才捲動 */
+  @media (min-width: 1100px) {
+    /* 以 Windows 150% 縮放的 1920x1080 筆電為基準：瀏覽器 100% 時可用約 1280x560，要一頁放下 */
+    body { padding: 12px 12px 4px; }
+    .stack {
+      max-width: none; display: grid; gap: 12px; align-items: stretch;
+      grid-template-columns: minmax(0, 1.25fr) repeat(3, minmax(0, 1fr));
+      grid-template-rows: 1fr auto; min-height: calc(100vh - 16px);
+    }
+    .footer { grid-column: 1 / -1; padding: 0; }
+    .card { display: flex; flex-direction: column; padding: 12px 14px 10px; }
+    .card-head, .prov-head { margin-bottom: 8px; }
+    .tabs { margin-bottom: 10px; }
+    .meter { margin-bottom: 7px; }
+    .meter-head { margin-bottom: 3px; }
+    .meter-reset { margin-top: 3px; }
+    .quota-error { margin-bottom: 8px; }
+    .caret { display: none; }
+    .expand { display: block; margin-top: 8px; padding-top: 8px; border-top: 1px solid #33363F; }
+    .sub-title { margin-bottom: 4px; }
+    .spend-row { padding: 3px 6px; }
+    .grants { margin-top: 4px; padding-top: 4px; }
+    .hint { margin-top: 4px; }
+    .token-list { gap: 6px; }
+    .trend { flex: 1; display: flex; flex-direction: column; min-height: 44px; }
+    .trend svg { flex: 1; height: auto; min-height: 24px; }
+    #spendCard .donut-row { flex: 1; min-height: 120px; gap: 14px; }
+    #spendCard .donut-wrap { width: clamp(110px, 24vh, 190px); height: clamp(110px, 24vh, 190px); }
+    #spendCard .donut-wrap svg { width: 100%; height: 100%; }
+    #spendCard .donut-center .amount { font-size: 28px; }
+    #spendCard .donut-center .unit { font-size: 12px; }
+    .popover { top: auto; bottom: calc(100% + 4px); }
+  }
 </style>
 </head>
 <body>
@@ -794,8 +828,9 @@ function trendHtml(p) {
   const peak = p.trend.reduce((a, b) => (b.tokens > a.tokens ? b : a));
   const bw = 300 / p.trend.length;
   const bars = p.trend.map((d, i) => {
-    const h = d.tokens ? Math.max(2, d.tokens / max * 34) : 1;
-    return `<rect x="${(i * bw + 1).toFixed(1)}" y="${(36 - h).toFixed(1)}" width="${(bw - 2).toFixed(1)}" height="${h.toFixed(1)}" rx="1.5"
+    // 寬螢幕上 SVG 會被垂直拉伸（preserveAspectRatio=none），所以不加圓角、空白日只畫很薄的底線
+    const h = d.tokens ? Math.max(1.2, d.tokens / max * 34) : 0.4;
+    return `<rect x="${(i * bw + 1).toFixed(1)}" y="${(36 - h).toFixed(1)}" width="${(bw - 2).toFixed(1)}" height="${h.toFixed(1)}"
       fill="${p.color}" opacity="${d.tokens ? 0.9 : 0.25}"><title>${d.date.slice(5)}　${d.tokens ? fmtTokens(d.tokens) + " tokens" : "No data"}</title></rect>`;
   }).join("");
   const range = `${p.trend[0].date.slice(5)} – ${p.trend[p.trend.length - 1].date.slice(5)}`;
@@ -855,7 +890,7 @@ function renderProviders() {
     const card = document.createElement("section");
     card.className = "card";
     const hint = p.name === "Antigravity CLI"
-      ? `<div class="hint">Antigravity 的花費受 splitrail 本身的 bug 影響，數字偏低。</div>` : "";
+      ? `<div class="hint" title="Antigravity 的花費受 splitrail 本身的 bug 影響，數字偏低。">花費受 splitrail bug 影響，數字偏低</div>` : "";
     card.innerHTML = `
       <div class="prov-head"><span class="dot" style="background:${p.color}"></span>${esc(p.name)}${
         p.quota && p.quota.plan ? `<span class="plan">${esc(p.quota.plan)}</span>` : ""}</div>
@@ -863,7 +898,7 @@ function renderProviders() {
       ${trendHtml(p)}
       <button class="caret" data-expand="prov${i}"><span>顯示更多</span><span class="chev">▾</span></button>
       <div class="expand" data-panel="prov${i}">
-        <div class="sub-title">花費（splitrail 估算，滑鼠移到數字上看分模型明細）</div>
+        <div class="sub-title" title="splitrail 用本機紀錄估算；滑鼠移到數字上看分模型明細">花費（估算，移上看分模型）</div>
         ${spendRowsHtml(p)}${grantsHtml(p)}${hint}
       </div>`;
     wrap.appendChild(card);
