@@ -220,17 +220,23 @@ def fetch_antigravity_quota():
             continue
         windows = []
         for g in groups:
-            pool = "Gemini" if re.search("gemini", g.get("displayName") or "", re.I) else (g.get("displayName") or "Claude")
+            # 兩個池：Gemini Models、Claude and GPT models（名稱照 OpenUsage 簡稱）
+            pool = "Gemini" if re.search("gemini", g.get("displayName") or "", re.I) else "Claude/GPT"
+            pool_windows = []
             for b in g.get("buckets") or []:
                 if b.get("remainingFraction") is None:
                     continue
                 secs = {"weekly": 604800, "daily": 86400}.get(b.get("window"), 18000)
-                windows.append({
+                pct = round((1 - b["remainingFraction"]) * 100, 1)
+                pool_windows.append({
                     "label": f"{pool} {window_label(secs)}",
-                    "pct": round((1 - b["remainingFraction"]) * 100, 1),
+                    "pct": pct,
                     "resets_at": b.get("resetTime"),
                     "secs": secs,
+                    # 5 小時窗沒用過時重置時間永遠是「現在＋5 小時」；每週窗照常倒數（同 OpenUsage）
+                    "not_started": pct == 0 and secs < 604800,
                 })
+            windows += sorted(pool_windows, key=lambda w: w["secs"])  # 短窗在上
         if windows:
             return {"windows": windows}
     return {"error": "Antigravity 本機服務沒有回應額度資料"}
