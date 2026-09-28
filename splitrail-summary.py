@@ -72,100 +72,224 @@ def window_label(seconds):
     return f"{seconds // 86400} 天" if seconds >= 86400 else f"{seconds // 3600} 小時"
 
 
-# ---------- 訂閱額度：由 Pane 提供（http://127.0.0.1:6736/v1/usage） ----------
-# Claude／Codex 的額度、方案、重置券一律向 Pane 要：Pane 會自己換新 token，Splitrail 不再讀寫任何憑證，
-# 避免兩個程式同時換 token 互相作廢。格式見 Pane 的 docs/local-http-api.md（與 macOS OpenUsage 相容）。
-PANE_API = "http://127.0.0.1:6736/v1/usage"
-PANE_PROVIDER_IDS = {"Claude Code": "claude", "Codex CLI": "codex", "Antigravity CLI": "antigravity"}
-PANE_LABELS = {"Session": "5 小時", "Weekly": "每週"}
-# Antigravity 的兩個額度池在 OpenUsage／Pane 叫 Session/Weekly（Gemini）與 Claude/Claude Weekly（其他模型）
-PANE_ANTIGRAVITY_LABELS = {"Session": "Gemini 5 小時", "Weekly": "Gemini 每週",
-                           "Claude": "Claude/GPT 5 小時", "Claude Weekly": "Claude/GPT 每週"}
-_pane_cache = {}
+# ---------- 訂閱額度：直接查官方用量 API（Claude token 過期時由本儀表板自己換新） ----------
+CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"  # Claude Code 的 OAuth client（同 OpenUsage）
+CLAUDE_OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+# Claude Code 的 User-Agent：重置券只回給這個來源；token 端點前的 Cloudflare 會以 403 (error 1010)
+# 擋掉 Python 預設的 User-Agent（2026-09-27 實測）
+CLAUDE_CLI_UA = "claude-cli/2.1.283 (external, cli)"
 
 
-def fetch_pane_usage():
-    """每次產生頁面只問 Pane 一次；Pane 沒在執行時回傳 None。"""
-    if "data" not in _pane_cache:
+def refresh_claude_token(cred_path):
+    """token 過期（或 5 分鐘內到期）時用 refresh token 換新，並寫回 ~/.claude/.credentials.json。
+
+    refresh token 用過即作廢，一定要寫回，否則 Claude Code CLI 下次拿舊的會被要求重新登入。
+    **同一時間只能有一個程式負責換新**（不要同時開 Pane／OpenUsage 這類也會換 token 的工具）。防護：
+    寫入前備份到 .credentials.json.splitrail-bak、沿用原本的 scopes、只改 token 相關欄位並保留其他欄位、
+    先寫暫存檔再整檔替換；寫入前重讀一次，若 CLI 在這期間已經換過就不覆蓋它的結果。
+    2026-09-27 實測：換新後 CLI 仍登入、可正常請求，寫回的 refresh token 可再次換新。
+    """
+    try:
+        with open(cred_path, encoding="utf-8") as f:
+            original_text = f.read()
+        data = json.loads(original_text)
+        oauth = data["claudeAiOauth"]
+        refresh_token = oauth["refreshToken"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return {"error": "Claude token 已過期，且讀不到 refresh token，請在終端機執行 claude auth login"}
+    scopes = oauth.get("scopes") or ["user:profile", "user:inference", "user:sessions:claude_code",
+                                     "user:mcp_servers", "user:file_upload"]
+    body = json.dumps({"grant_type": "refresh_token", "refresh_token": refresh_token,
+                       "client_id": CLAUDE_OAUTH_CLIENT_ID, "scope": " ".join(scopes)}).encode()
+    req = urllib.request.Request(CLAUDE_OAUTH_TOKEN_URL, body,
+                                 {"Content-Type": "application/json", "User-Agent": CLAUDE_CLI_UA})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            got = json.load(resp)
+    except urllib.error.HTTPError as e:
         try:
-            with urllib.request.urlopen(PANE_API, timeout=5) as resp:
-                data = json.load(resp)
-            _pane_cache["data"] = data if isinstance(data, list) else None
-        except (urllib.error.URLError, OSError, ValueError):
-            _pane_cache["data"] = None
-    return _pane_cache["data"]
+            code = json.loads(e.read()).get("error")
+        except ValueError:
+            code = None
+        if code == "invalid_grant":
+            return {"error": "Claude 登入已失效，請在終端機執行 claude auth login 重新登入"}
+        return {"error": f"Claude token 更新失敗（HTTP {e.code}）"}
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return {"error": f"Claude token 更新失敗：{e}"}
+    if not got.get("access_token"):
+        return {"error": "Claude token 更新失敗：回應沒有新的 access token"}
 
+    now_ms = time.time() * 1000
+    new_oauth = dict(oauth)
+    new_oauth["accessToken"] = got["access_token"]
+    if got.get("refresh_token"):
+        new_oauth["refreshToken"] = got["refresh_token"]
+    if got.get("expires_in"):
+        new_oauth["expiresAt"] = int(now_ms + got["expires_in"] * 1000)
+    if got.get("refresh_token_expires_in"):
+        new_oauth["refreshTokenExpiresAt"] = int(now_ms + got["refresh_token_expires_in"] * 1000)
+    result = {"token": got["access_token"], "oauth": new_oauth}
 
-def ensure_pane_running(timeout=40):
-    """Pane 沒開就啟動它，並等到它的 API 有資料（剛啟動的前十幾秒 API 會回空陣列）。"""
-    def ready():
-        _pane_cache.clear()
-        return bool(fetch_pane_usage())
-    if ready():
-        return
-    exe = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Pane", "pane.exe")
-    if not os.path.isfile(exe):
-        print("找不到 Pane（%LOCALAPPDATA%\\Pane\\pane.exe），額度卡片會是空的", file=sys.stderr)
-        return
-    if fetch_pane_usage() is None:  # API 連不上＝Pane 沒在執行；有連上但還沒資料就只等待
-        print("啟動 Pane…")
-        subprocess.Popen([exe], creationflags=getattr(subprocess, "DETACHED_PROCESS", 0), close_fds=True)
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        time.sleep(2)
-        if ready():
-            print("Pane 已就緒")
-            return
-    _pane_cache.clear()
-    print(f"等了 {timeout} 秒 Pane 仍沒有資料，額度卡片可能是空的", file=sys.stderr)
-
-
-def pane_quota(name):
-    data = fetch_pane_usage()
-    if data is None:
-        return {"error": "Pane 沒有在執行（Claude／Codex 額度由 Pane 提供，請開啟 Pane）"}
-    pid = PANE_PROVIDER_IDS[name]
-    entry = next((e for e in data if str(e.get("providerId", "")) == pid
-                  or str(e.get("providerId", "")).startswith(pid + "@")), None)  # 多帳號時 Pane 用 claude@<hash>
-    if not entry:
-        return {"error": f"Pane 沒有 {name} 的資料（請在 Pane 裡啟用這個服務）"}
-    labels = PANE_ANTIGRAVITY_LABELS if pid == "antigravity" else PANE_LABELS
-    windows, grants = [], None
-    for line in entry.get("lines") or []:
-        label = str(line.get("label") or "")
-        if line.get("type") == "progress" and line.get("used") is not None                 and (line.get("format") or {}).get("kind", "percent") == "percent":
-            windows.append({
-                "label": labels.get(label) or re.sub(r" Weekly$", " 每週", label),
-                "pct": line["used"],
-                "resets_at": line.get("resetsAt"),
-                "secs": int((line.get("periodDurationMs") or 0) / 1000),
-            })
-        elif line.get("type") == "text" and re.search(r"(?i)\breset", label):
-            # Pane 只提供「N available」與最早到期時間，不提供每張券的內容
-            m = re.match(r"\s*(\d+)", str(line.get("value") or ""))
-            count = int(m.group(1)) if m else 0
-            grants = {"count": count, "items": [{"label": "額度重置券（最早到期）", "left": count,
-                                                   "ends_at": line.get("resetsAt"), "usable_now": False}] if count else []}
-    if not windows:
-        return {"error": f"Pane 目前沒有 {name} 的額度資料"}
-    plan = entry.get("plan")
-    if isinstance(plan, str) and plan.islower():
-        plan = plan.capitalize()  # Pane 回傳 Claude 的方案是小寫 "pro"，Antigravity 則是 "Pro"
-    result = {"windows": windows, "plan": plan, "grants": grants}
-    if entry.get("stale"):
-        result["note"] = "Pane 最近一次更新失敗，顯示的是較舊的資料"
+    try:
+        with open(cred_path, encoding="utf-8") as f:
+            if f.read() != original_text:
+                return result  # CLI 在這期間已經更新過憑證檔，保留它的版本；這次用我們換到的 token 就好
+        with open(cred_path + ".splitrail-bak", "w", encoding="utf-8", newline="") as f:
+            f.write(original_text)
+        data["claudeAiOauth"] = new_oauth
+        tmp = cred_path + ".splitrail-tmp"
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            f.write(json.dumps(data, separators=(",", ":")))  # 與原檔相同的緊湊格式
+        os.replace(tmp, cred_path)
+    except OSError as e:
+        # 伺服器已經作廢舊的 refresh token，寫不回去 CLI 下次就得重新登入——一定要讓使用者看到
+        print(f"⚠ Claude token 已更新但寫回憑證檔失敗：{e}；Claude Code CLI 可能需要重新登入（claude auth login）",
+              file=sys.stderr)
     return result
 
 
-def antigravity_quota():
-    """Antigravity 先問 Pane；Pane 抓不到（例如 Kaspersky 擋了 Pane 呼叫 PowerShell）時改用直讀本機服務。"""
-    q = pane_quota("Antigravity CLI")
-    if "error" not in q:
-        return q
-    direct = fetch_antigravity_quota()
-    if "windows" in direct:
-        direct["note"] = "Pane 沒有 Antigravity 額度，改由儀表板直接讀取"
-    return direct
+def fetch_claude_quota():
+    """查 Claude 訂閱額度（claude /usage 背後的 API）：5 小時窗與每週窗的使用率和重置時間。
+
+    token 取自 Claude Code CLI 的 ~/.claude/.credentials.json；過期時由 refresh_claude_token 換新並寫回
+    （桌面 App 不會更新這個檔）。任何失敗都回傳 error，不中斷整頁產生。
+    """
+    cred_path = os.path.join(os.path.expanduser("~"), ".claude", ".credentials.json")
+    try:
+        with open(cred_path, encoding="utf-8") as f:
+            oauth = json.load(f)["claudeAiOauth"]
+        token = oauth["accessToken"]
+    except (OSError, ValueError, KeyError):
+        return {"error": "找不到 Claude 憑證（~/.claude/.credentials.json）"}
+    if oauth.get("expiresAt") and time.time() * 1000 > oauth["expiresAt"] - 5 * 60 * 1000:
+        refreshed = refresh_claude_token(cred_path)
+        if "error" in refreshed:
+            return refreshed
+        token, oauth = refreshed["token"], refreshed["oauth"]
+    headers = {
+        "Authorization": "Bearer " + token,
+        "anthropic-beta": "oauth-2025-04-20",
+        # 額度重置券（cedar_ember）只回給 Claude Code 這個來源，其他 User-Agent 會得到
+        # eligible:false, ineligible_reason:"surface"（2026-09-27 實測；OpenUsage 同樣寫死版本號）
+        "User-Agent": CLAUDE_CLI_UA,
+    }
+    req = urllib.request.Request("https://api.anthropic.com/api/oauth/usage?cedar_ember=1", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.load(resp)
+    except urllib.error.HTTPError as e:
+        return {"error": f"額度 API 回應 HTTP {e.code}"}
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return {"error": f"額度 API 連線失敗：{e}"}
+    windows = []
+    for key, label, secs in (("five_hour", "5 小時", 18000), ("seven_day", "每週", 604800)):
+        w = data.get(key) or {}
+        if w.get("utilization") is None:
+            continue
+        windows.append({"label": label, "pct": w["utilization"], "resets_at": w.get("resets_at"), "secs": secs})
+    if not windows:
+        return {"error": "額度 API 回應中沒有 5 小時／每週額度資料"}
+    return {"windows": windows, "grants": parse_claude_reset_grants(data.get("cedar_ember")),
+            "plan": fetch_claude_plan(headers, oauth.get("subscriptionType"), oauth.get("rateLimitTier"))}
+
+
+def parse_claude_reset_grants(block):
+    """額度重置券（Anthropic 偶爾贈送，可清空 5 小時／每週窗）。沒有這個區塊回傳 None；
+
+    不符資格算 0 張；已過期或用完的券略過（同 OpenUsage 的判斷）。
+    """
+    if not isinstance(block, dict):
+        return None
+    items = []
+    if block.get("eligible"):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        for g in block.get("grants") or []:
+            left = int(g.get("resets_left") or 0)
+            ends_at = g.get("ends_at")
+            if left < 1:
+                continue
+            try:
+                if ends_at and datetime.datetime.fromisoformat(ends_at) <= now:
+                    continue
+            except ValueError:
+                pass
+            items.append({"label": g.get("label") or g.get("id") or "額度重置", "left": left,
+                          "ends_at": ends_at, "usable_now": bool(g.get("usable_now"))})
+    return {"count": sum(i["left"] for i in items), "items": items}
+
+
+def format_claude_plan(org_type, tier):
+    """claude_max + default_claude_max_20x → "Max 20x"；claude_pro → "Pro"。"""
+    if not org_type:
+        return None
+    name = org_type.removeprefix("claude_").replace("_", " ").title()
+    m = re.search(r"\d+x", tier or "")
+    return f"{name} {m.group(0)}" if m else name
+
+
+def fetch_claude_plan(headers, stored_type, stored_tier):
+    """方案名稱以即時 profile 為準（升級後不用重新登入就會更新）；查不到就退回憑證檔裡登入當時的方案。"""
+    req = urllib.request.Request("https://api.anthropic.com/api/oauth/profile", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            org = json.load(resp).get("organization") or {}
+        plan = format_claude_plan(org.get("organization_type"), org.get("rate_limit_tier"))
+        if plan:
+            return plan
+    except (urllib.error.URLError, OSError, ValueError, AttributeError):
+        pass
+    return format_claude_plan(f"claude_{stored_type}" if stored_type else None, stored_tier)
+
+
+def fetch_codex_quota():
+    """查 Codex（ChatGPT 方案）額度：token 取自 Codex CLI 的 ~/.codex/auth.json。
+
+    依窗長（limit_window_seconds）分辨 5 小時／每週，不依 primary/secondary 位置——
+    Codex 有時會把剩下的每週窗搬進 primary（OpenUsage 文件記載的行為）。
+    """
+    auth_path = os.path.join(os.path.expanduser("~"), ".codex", "auth.json")
+    try:
+        with open(auth_path, encoding="utf-8") as f:
+            tokens = json.load(f)["tokens"]
+        headers = {
+            "Authorization": "Bearer " + tokens["access_token"],
+            "originator": "codex_cli_rs",
+            "User-Agent": "codex_cli_rs",
+        }
+    except (OSError, ValueError, KeyError, TypeError):
+        return {"error": "找不到 Codex 憑證（~/.codex/auth.json）"}
+    if tokens.get("account_id"):
+        headers["chatgpt-account-id"] = tokens["account_id"]
+    req = urllib.request.Request("https://chatgpt.com/backend-api/wham/usage", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.load(resp)
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            return {"error": "Codex token 已失效，在終端機執行一次 codex 指令即可刷新"}
+        return {"error": f"Codex 額度 API 回應 HTTP {e.code}"}
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return {"error": f"Codex 額度 API 連線失敗：{e}"}
+    rl = data.get("rate_limit") or {}
+    windows = []
+    for w in (rl.get("primary_window"), rl.get("secondary_window")):
+        if not w or w.get("used_percent") is None:
+            continue
+        secs = w.get("limit_window_seconds") or 0
+        reset_at = w.get("reset_at")
+        windows.append({
+            "label": window_label(secs),
+            "pct": w["used_percent"],
+            "resets_at": datetime.datetime.fromtimestamp(reset_at, datetime.timezone.utc).isoformat() if reset_at else None,
+            "secs": secs,
+            # 窗還沒開始計時：API 回報的重置時間永遠是「現在＋整個窗長」
+            "not_started": w["used_percent"] == 0 and (w.get("reset_after_seconds") or 0) >= secs > 0,
+        })
+    if not windows:
+        return {"error": "Codex 額度 API 回應中沒有額度窗資料"}
+    windows.sort(key=lambda w: w["secs"])  # 短窗在上，跟 Claude 卡片同順序
+    plan = data.get("plan_type")
+    return {"windows": windows, "plan": plan.capitalize() if isinstance(plan, str) and plan else None}
 
 
 AGY_PROC_VBS = r'''Set wmi = GetObject("winmgmts:\\.\root\cimv2")
@@ -260,9 +384,9 @@ def fetch_antigravity_quota():
 
 
 QUOTA_FETCHERS = {
-    "Claude Code": lambda: pane_quota("Claude Code"),
-    "Codex CLI": lambda: pane_quota("Codex CLI"),
-    "Antigravity CLI": antigravity_quota,
+    "Claude Code": fetch_claude_quota,
+    "Codex CLI": fetch_codex_quota,
+    "Antigravity CLI": fetch_antigravity_quota,
 }
 
 
@@ -1233,8 +1357,6 @@ def main():
     print_table(rows, today)
 
     if want_html:
-        if "--no-open" not in sys.argv:
-            ensure_pane_running()  # 只在手動開網頁時啟動 Pane；背景更新（--no-open）不會，免得關掉的 Pane 又被打開
         providers = build_providers(data, today)
         html = build_html(providers, datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
         path = out_path or os.path.join(SCRIPT_DIR, "splitrail-dashboard.html")
