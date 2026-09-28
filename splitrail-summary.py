@@ -2,7 +2,8 @@
 """一鍵彙總 Claude Code / Codex CLI / Antigravity CLI 三家用量。
 
 跑 `splitrail.exe stats`，把 JSON 結果聚合成一張總覽表印出來。
-費用是 splitrail 用本機 token 記錄反推的估算值，不是官方帳單金額，
+費用是用本機 token 紀錄乘上官方 API 單價的估算值（Claude 由 splitrail 計算，
+Codex／Antigravity 自行計算），不是官方帳單金額，
 只拿來看相對趨勢，對帳請以官方帳單為準。
 """
 import json
@@ -13,7 +14,8 @@ import subprocess
 import tempfile
 import sys
 import datetime
-import time
+import glob
+import sqlite3
 import urllib.error
 import urllib.request
 import webbrowser
@@ -41,12 +43,16 @@ DEFAULT_COLOR = "#8A8F98"
 
 
 def run_splitrail():
-    result = subprocess.run(
-        [SPLITRAIL_EXE, "stats"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
+    try:
+        result = subprocess.run(
+            [SPLITRAIL_EXE, "stats"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+    except OSError:
+        print("找不到 splitrail.exe，請依 README 安裝步驟下載並放進本資料夾", file=sys.stderr)
+        sys.exit(1)
     if result.returncode != 0:
         print("splitrail.exe 執行失敗：", result.stderr.strip(), file=sys.stderr)
         sys.exit(1)
@@ -57,96 +63,6 @@ def run_splitrail():
         sys.exit(1)
 
 
-def fetch_claude_quota():
-    """查 Claude 訂閱額度（claude /usage 背後的 API）：5 小時窗與每週窗的使用率和重置時間。
-
-    token 取自 Claude Code CLI 的 ~/.claude/.credentials.json，只在 CLI 執行時才會刷新
-    （約 8 小時過期，桌面 App 不會寫這個檔）。任何失敗都回傳 error，不中斷整頁產生。
-    """
-    cred_path = os.path.join(os.path.expanduser("~"), ".claude", ".credentials.json")
-    try:
-        with open(cred_path, encoding="utf-8") as f:
-            oauth = json.load(f)["claudeAiOauth"]
-        token = oauth["accessToken"]
-    except (OSError, ValueError, KeyError):
-        return {"error": "找不到 Claude 憑證（~/.claude/.credentials.json）"}
-    if oauth.get("expiresAt") and time.time() * 1000 > oauth["expiresAt"]:
-        return {"error": "Claude token 已過期，在終端機執行一次 claude 指令即可刷新"}
-    headers = {
-        "Authorization": "Bearer " + token,
-        "anthropic-beta": "oauth-2025-04-20",
-        # 額度重置券（cedar_ember）只回給 Claude Code 這個來源，其他 User-Agent 會得到
-        # eligible:false, ineligible_reason:"surface"（2026-09-27 實測；OpenUsage 同樣寫死版本號）
-        "User-Agent": "claude-cli/2.1.283 (external, cli)",
-    }
-    req = urllib.request.Request("https://api.anthropic.com/api/oauth/usage?cedar_ember=1", headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.load(resp)
-    except urllib.error.HTTPError as e:
-        return {"error": f"額度 API 回應 HTTP {e.code}"}
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        return {"error": f"額度 API 連線失敗：{e}"}
-    windows = []
-    for key, label, secs in (("five_hour", "5 小時", 18000), ("seven_day", "每週", 604800)):
-        w = data.get(key) or {}
-        if w.get("utilization") is None:
-            continue
-        windows.append({"label": label, "pct": w["utilization"], "resets_at": w.get("resets_at"), "secs": secs})
-    if not windows:
-        return {"error": "額度 API 回應中沒有 5 小時／每週額度資料"}
-    return {"windows": windows, "grants": parse_claude_reset_grants(data.get("cedar_ember")),
-            "plan": fetch_claude_plan(headers, oauth.get("subscriptionType"), oauth.get("rateLimitTier"))}
-
-
-def parse_claude_reset_grants(block):
-    """額度重置券（Anthropic 偶爾贈送，可清空 5 小時／每週窗）。沒有這個區塊回傳 None；
-
-    不符資格算 0 張；已過期或用完的券略過（同 OpenUsage 的判斷）。
-    """
-    if not isinstance(block, dict):
-        return None
-    items = []
-    if block.get("eligible"):
-        now = datetime.datetime.now(datetime.timezone.utc)
-        for g in block.get("grants") or []:
-            left = int(g.get("resets_left") or 0)
-            ends_at = g.get("ends_at")
-            if left < 1:
-                continue
-            try:
-                if ends_at and datetime.datetime.fromisoformat(ends_at) <= now:
-                    continue
-            except ValueError:
-                pass
-            items.append({"label": g.get("label") or g.get("id") or "額度重置", "left": left,
-                          "ends_at": ends_at, "usable_now": bool(g.get("usable_now"))})
-    return {"count": sum(i["left"] for i in items), "items": items}
-
-
-def format_claude_plan(org_type, tier):
-    """claude_max + default_claude_max_20x → "Max 20x"；claude_pro → "Pro"。"""
-    if not org_type:
-        return None
-    name = org_type.removeprefix("claude_").replace("_", " ").title()
-    m = re.search(r"\d+x", tier or "")
-    return f"{name} {m.group(0)}" if m else name
-
-
-def fetch_claude_plan(headers, stored_type, stored_tier):
-    """方案名稱以即時 profile 為準（升級後不用重新登入就會更新）；查不到就退回憑證檔裡登入當時的方案。"""
-    req = urllib.request.Request("https://api.anthropic.com/api/oauth/profile", headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            org = json.load(resp).get("organization") or {}
-        plan = format_claude_plan(org.get("organization_type"), org.get("rate_limit_tier"))
-        if plan:
-            return plan
-    except (urllib.error.URLError, OSError, ValueError, AttributeError):
-        pass
-    return format_claude_plan(f"claude_{stored_type}" if stored_type else None, stored_tier)
-
-
 def window_label(seconds):
     if seconds == 18000:
         return "5 小時"
@@ -155,54 +71,76 @@ def window_label(seconds):
     return f"{seconds // 86400} 天" if seconds >= 86400 else f"{seconds // 3600} 小時"
 
 
-def fetch_codex_quota():
-    """查 Codex（ChatGPT 方案）額度：token 取自 Codex CLI 的 ~/.codex/auth.json。
+# ---------- 訂閱額度：由 Pane 提供（http://127.0.0.1:6736/v1/usage） ----------
+# Claude／Codex 的額度、方案、重置券一律向 Pane 要：Pane 會自己換新 token，Splitrail 不再讀寫任何憑證，
+# 避免兩個程式同時換 token 互相作廢。格式見 Pane 的 docs/local-http-api.md（與 macOS OpenUsage 相容）。
+PANE_API = "http://127.0.0.1:6736/v1/usage"
+PANE_PROVIDER_IDS = {"Claude Code": "claude", "Codex CLI": "codex", "Antigravity CLI": "antigravity"}
+PANE_LABELS = {"Session": "5 小時", "Weekly": "每週"}
+# Antigravity 的兩個額度池在 OpenUsage／Pane 叫 Session/Weekly（Gemini）與 Claude/Claude Weekly（其他模型）
+PANE_ANTIGRAVITY_LABELS = {"Session": "Gemini 5 小時", "Weekly": "Gemini 每週",
+                           "Claude": "Claude/GPT 5 小時", "Claude Weekly": "Claude/GPT 每週"}
+_pane_cache = {}
 
-    依窗長（limit_window_seconds）分辨 5 小時／每週，不依 primary/secondary 位置——
-    Codex 有時會把剩下的每週窗搬進 primary（OpenUsage 文件記載的行為）。
-    """
-    auth_path = os.path.join(os.path.expanduser("~"), ".codex", "auth.json")
-    try:
-        with open(auth_path, encoding="utf-8") as f:
-            tokens = json.load(f)["tokens"]
-        headers = {
-            "Authorization": "Bearer " + tokens["access_token"],
-            "originator": "codex_cli_rs",
-            "User-Agent": "codex_cli_rs",
-        }
-    except (OSError, ValueError, KeyError, TypeError):
-        return {"error": "找不到 Codex 憑證（~/.codex/auth.json）"}
-    if tokens.get("account_id"):
-        headers["chatgpt-account-id"] = tokens["account_id"]
-    req = urllib.request.Request("https://chatgpt.com/backend-api/wham/usage", headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.load(resp)
-    except urllib.error.HTTPError as e:
-        if e.code in (401, 403):
-            return {"error": "Codex token 已失效，在終端機執行一次 codex 指令即可刷新"}
-        return {"error": f"Codex 額度 API 回應 HTTP {e.code}"}
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        return {"error": f"Codex 額度 API 連線失敗：{e}"}
-    rl = data.get("rate_limit") or {}
-    windows = []
-    for w in (rl.get("primary_window"), rl.get("secondary_window")):
-        if not w or w.get("used_percent") is None:
-            continue
-        secs = w.get("limit_window_seconds") or 0
-        reset_at = w.get("reset_at")
-        windows.append({
-            "label": window_label(secs),
-            "pct": w["used_percent"],
-            "resets_at": datetime.datetime.fromtimestamp(reset_at, datetime.timezone.utc).isoformat() if reset_at else None,
-            "secs": secs,
-            # 窗還沒開始計時：API 回報的重置時間永遠是「現在＋整個窗長」
-            "not_started": w["used_percent"] == 0 and (w.get("reset_after_seconds") or 0) >= secs > 0,
-        })
+
+def fetch_pane_usage():
+    """每次產生頁面只問 Pane 一次；Pane 沒在執行時回傳 None。"""
+    if "data" not in _pane_cache:
+        try:
+            with urllib.request.urlopen(PANE_API, timeout=5) as resp:
+                data = json.load(resp)
+            _pane_cache["data"] = data if isinstance(data, list) else None
+        except (urllib.error.URLError, OSError, ValueError):
+            _pane_cache["data"] = None
+    return _pane_cache["data"]
+
+
+def pane_quota(name):
+    data = fetch_pane_usage()
+    if data is None:
+        return {"error": "Pane 沒有在執行（Claude／Codex 額度由 Pane 提供，請開啟 Pane）"}
+    pid = PANE_PROVIDER_IDS[name]
+    entry = next((e for e in data if str(e.get("providerId", "")) == pid
+                  or str(e.get("providerId", "")).startswith(pid + "@")), None)  # 多帳號時 Pane 用 claude@<hash>
+    if not entry:
+        return {"error": f"Pane 沒有 {name} 的資料（請在 Pane 裡啟用這個服務）"}
+    labels = PANE_ANTIGRAVITY_LABELS if pid == "antigravity" else PANE_LABELS
+    windows, grants = [], None
+    for line in entry.get("lines") or []:
+        label = str(line.get("label") or "")
+        if line.get("type") == "progress" and line.get("used") is not None                 and (line.get("format") or {}).get("kind", "percent") == "percent":
+            windows.append({
+                "label": labels.get(label) or re.sub(r" Weekly$", " 每週", label),
+                "pct": line["used"],
+                "resets_at": line.get("resetsAt"),
+                "secs": int((line.get("periodDurationMs") or 0) / 1000),
+            })
+        elif line.get("type") == "text" and re.search(r"(?i)\breset", label):
+            # Pane 只提供「N available」與最早到期時間，不提供每張券的內容
+            m = re.match(r"\s*(\d+)", str(line.get("value") or ""))
+            count = int(m.group(1)) if m else 0
+            grants = {"count": count, "items": [{"label": "額度重置券（最早到期）", "left": count,
+                                                   "ends_at": line.get("resetsAt"), "usable_now": False}] if count else []}
     if not windows:
-        return {"error": "Codex 額度 API 回應中沒有額度窗資料"}
-    windows.sort(key=lambda w: w["secs"])  # 短窗在上，跟 Claude 卡片同順序
-    return {"windows": windows}
+        return {"error": f"Pane 目前沒有 {name} 的額度資料"}
+    plan = entry.get("plan")
+    if isinstance(plan, str) and plan.islower():
+        plan = plan.capitalize()  # Pane 回傳 Claude 的方案是小寫 "pro"，Antigravity 則是 "Pro"
+    result = {"windows": windows, "plan": plan, "grants": grants}
+    if entry.get("stale"):
+        result["note"] = "Pane 最近一次更新失敗，顯示的是較舊的資料"
+    return result
+
+
+def antigravity_quota():
+    """Antigravity 先問 Pane；Pane 抓不到（例如 Kaspersky 擋了 Pane 呼叫 PowerShell）時改用直讀本機服務。"""
+    q = pane_quota("Antigravity CLI")
+    if "error" not in q:
+        return q
+    direct = fetch_antigravity_quota()
+    if "windows" in direct:
+        direct["note"] = "Pane 沒有 Antigravity 額度，改由儀表板直接讀取"
+    return direct
 
 
 AGY_PROC_VBS = r'''Set wmi = GetObject("winmgmts:\\.\root\cimv2")
@@ -257,6 +195,7 @@ def fetch_antigravity_quota():
     if not targets:
         return {"error": "Antigravity 沒有在執行（開著 Antigravity App 或 agy 才抓得到額度）"}
     ctx = ssl._create_unverified_context()  # 本機 loopback 自簽憑證，只對 127.0.0.1 略過驗證
+    # 僅限連本機 127.0.0.1 的 Antigravity language server（自簽憑證）；不得把這個 context 用在任何對外連線。
     body = json.dumps({"metadata": {"ideName": "antigravity", "extensionName": "antigravity",
                                     "locale": "en", "ideVersion": "1.0.0"}}).encode()
     for port, token in targets:
@@ -296,9 +235,9 @@ def fetch_antigravity_quota():
 
 
 QUOTA_FETCHERS = {
-    "Claude Code": fetch_claude_quota,
-    "Codex CLI": fetch_codex_quota,
-    "Antigravity CLI": fetch_antigravity_quota,
+    "Claude Code": lambda: pane_quota("Claude Code"),
+    "Codex CLI": lambda: pane_quota("Codex CLI"),
+    "Antigravity CLI": antigravity_quota,
 }
 
 
@@ -355,6 +294,328 @@ def build_providers(data, today):
             "quota": QUOTA_FETCHERS[name]() if name in QUOTA_FETCHERS else None,
         })
     return providers
+
+
+# ---------- Antigravity 花費：自己讀本機對話資料庫（取代 splitrail 的 Antigravity 數字） ----------
+# splitrail 3.10.1 把 token 欄位對錯（把 input 當 output、cache 當 input）、只讀 CLI 資料夾，數字不可用。
+# 這裡照 OpenUsage／CrossUsage 的讀法：~/.gemini/antigravity*/conversations/**/*.db 的 gen_metadata 逐筆讀，
+# data 為 protobuf：field 1 → field 4 = 用量（1 系統提示＋2 input＝計費 input、3 output、5 cache read），
+# field 19 模型代號、21 顯示名稱，field 9 → 4 為時間（缺的話用 steps.metadata 的 field 1）。
+
+# 美元／每百萬 token：(input, output, cache read)。來源：Google 官方價目頁
+# https://ai.google.dev/gemini-api/docs/pricing（2026-09-28 核對，頁面更新於 2026-09-24）。
+# 3.6～3.8 Flash 的優惠價到 2026-12-31，之後恢復原價；3.1 Pro 單次提示超過 20 萬 token 用較高單價。
+GEMINI_PRICES = {
+    "gemini-3.8-flash": [(datetime.date(2026, 12, 31), (0.75, 3.75, 0.075)), (None, (1.5, 7.5, 0.15))],
+    "gemini-3.7-flash": [(datetime.date(2026, 12, 31), (0.75, 3.75, 0.075)), (None, (1.5, 7.5, 0.15))],
+    "gemini-3.6-flash": [(datetime.date(2026, 12, 31), (0.75, 3.75, 0.075)), (None, (1.5, 7.5, 0.15))],
+    "gemini-3.5-flash": [(None, (1.5, 9.0, 0.15))],
+    "gemini-3.1-pro": [(None, (2.0, 12.0, 0.2))],
+}
+GEMINI_PRO_LONG_PROMPT = (200_000, (4.0, 18.0, 0.4))
+
+
+def _pb_varint(b, i):
+    result = shift = 0
+    while True:
+        c = b[i]
+        i += 1
+        result |= (c & 0x7F) << shift
+        shift += 7
+        if c < 0x80:
+            return result, i
+
+
+def _pb_fields(b):
+    """把 protobuf 位元組拆成 [(欄位號, wire type, 值)]；遇到壞資料就回傳已解出的部分。"""
+    out, i = [], 0
+    try:
+        while i < len(b):
+            key, i = _pb_varint(b, i)
+            num, wt = key >> 3, key & 7
+            if wt == 0:
+                val, i = _pb_varint(b, i)
+            elif wt == 2:
+                n, i = _pb_varint(b, i)
+                val, i = b[i:i + n], i + n
+            elif wt == 1:
+                val, i = b[i:i + 8], i + 8
+            elif wt == 5:
+                val, i = b[i:i + 4], i + 4
+            else:
+                return out
+            out.append((num, wt, val))
+    except IndexError:
+        pass
+    return out
+
+
+def _pb_get(b, num, wt):
+    return next((v for n, w, v in _pb_fields(b) if n == num and w == wt), None) if b else None
+
+
+def gemini_canonical(model_id, label):
+    """內部代號／顯示名稱 → 計價用模型名。優先看顯示名稱（使用者實際選的模型），
+    因為同一個代號會對應不同版本，例如 gemini-3-flash-a 的顯示名稱是「Gemini 3.5 Flash」。"""
+    m = re.match(r"(?i)^Gemini (3\.[5-8]) Flash\b", label or "")
+    if m:
+        return f"gemini-{m.group(1)}-flash"
+    if re.match(r"(?i)^Gemini 3\.1 Pro\b", label or ""):
+        return "gemini-3.1-pro"
+    m = re.match(r"^gemini-(3\.[5-8])-flash\b", model_id or "")
+    if m:
+        return f"gemini-{m.group(1)}-flash"
+    if re.match(r"^gemini-(3\.1-pro|pro-(default|agent))\b", model_id or ""):
+        return "gemini-3.1-pro"
+    return model_id or label or "unknown"
+
+
+def gemini_cost(model, day, inp, out, cache):
+    tiers = GEMINI_PRICES.get(model)
+    if not tiers:
+        return None  # 沒有單價：token 照算，花費不計，模型名稱會出現在分模型明細裡
+    price = next(p for until, p in tiers if until is None or day <= until)
+    if model == "gemini-3.1-pro" and inp + cache > GEMINI_PRO_LONG_PROMPT[0]:
+        price = GEMINI_PRO_LONG_PROMPT[1]
+    return (inp * price[0] + out * price[1] + cache * price[2]) / 1_000_000
+
+
+def scan_antigravity_daily():
+    """回傳 (daily, 對話數)：daily 與 splitrail daily_stats 同形狀 {日期: {"stats", "model_stats"}}；
+    每個 .db 是一段對話。讀不了的 db 略過。"""
+    daily, conversations = {}, set()
+    root = os.path.join(os.path.expanduser("~"), ".gemini")
+    for db in glob.glob(os.path.join(root, "antigravity*", "conversations", "**", "*.db"), recursive=True):
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            cols = [r[1] for r in con.execute("PRAGMA table_info(steps)")]
+            step_meta = dict(con.execute("SELECT idx, metadata FROM steps")) if "metadata" in cols else {}
+            rows = con.execute("SELECT idx, data FROM gen_metadata WHERE data IS NOT NULL").fetchall()
+            con.close()
+        except sqlite3.Error:
+            continue
+        for idx, data in rows:
+            event = _pb_get(data, 1, 2)
+            usage = _pb_get(event, 4, 2)
+            if not usage:
+                continue
+            u = {n: v for n, w, v in _pb_fields(usage) if w == 0}
+            inp, out, cache = u.get(1, 0) + u.get(2, 0), u.get(3, 0), u.get(5, 0)
+            if not (u.get(2) or out or cache):
+                continue  # 只有系統提示數的簿記紀錄，不是一次生成（同 OpenUsage）
+            ts = _pb_get(_pb_get(_pb_get(event, 9, 2), 4, 2), 1, 0) or _pb_get(_pb_get(step_meta.get(idx), 1, 2), 1, 0)
+            if not ts:
+                continue
+            day = datetime.datetime.fromtimestamp(ts).date()
+            conversations.add(db)
+            model_id = (_pb_get(event, 19, 2) or b"").decode("utf-8", "replace")
+            label = (_pb_get(event, 21, 2) or b"").decode("utf-8", "replace")
+            model = gemini_canonical(model_id, label)
+            cost = gemini_cost(model, day, inp, out, cache) or 0.0
+            d = daily.setdefault(day.isoformat(), {"stats": {}, "model_stats": {}})
+            for target in (d["stats"], d["model_stats"].setdefault(model, {"model": model})):
+                target["inputTokens"] = target.get("inputTokens", 0) + inp
+                target["outputTokens"] = target.get("outputTokens", 0) + out
+                target["cachedTokens"] = target.get("cachedTokens", 0) + cache
+            d["stats"]["costCents"] = d["stats"].get("costCents", 0) + cost * 100
+            m = d["model_stats"][model]
+            m["cost"] = m.get("cost", 0) + cost
+    return daily, len(conversations)
+
+
+# ---------- Codex 花費：自己讀 ~/.codex/sessions（取代 splitrail 的 Codex 數字） ----------
+# splitrail 一律用標準價、不處理 fork／subagent 子 session 重播父 session 的 token 歷史、沒有 272K 長 context 單價。
+# 子 session 重播的處理方式也跟 OpenUsage／CrossUsage／Pane 不同，見 parse_codex_session。
+# 這裡照 OpenUsage／CrossUsage／Pane 的做法補上。reasoning 不另外加到 output：本機紀錄 5,109 筆 reasoning>0 的回合
+# 全部是 total_tokens = input + output，reasoning 已包含在 output 內（2026-09-28 實測）。
+# 與 Pane 的 spend_cache 逐模型對照（2026-09-28）：terra、astra 完全一致；sol 差在單價（Pane 用原價）；
+# Pane 另把子 session 重播的父 session 歷史算成 gpt-5（重複計算），這裡不會。
+
+# 美元／每百萬 token：(input, cache read, output, 超過 272K 時的 (input, cache, output), fast 倍率)。
+# 來源：OpenAI 官方模型頁 developers.openai.com/api/docs/models/<model>（2026-09-28 核對）。
+# gpt-5.6-sol 用原價 5/0.5/30（官方頁目前的促銷價 4/0.4/20 未載明開始日期；使用者裁定用原價，與 Pane／OpenUsage 一致）。
+# fast（原 priority，2026-07-30 改名）倍率：gpt-6-astra 官方頁寫 2 倍；gpt-5.5 2.5 倍、5.6 系列 2 倍取自
+# OpenUsage／CrossUsage 的對照表（5.6 系列官方頁未寫，未查證）。
+CODEX_PRICES = {
+    "gpt-6-astra": (10.0, 1.0, 50.0, (20.0, 2.0, 75.0), 2.0),
+    "gpt-5.6-sol": (5.0, 0.5, 30.0, (10.0, 1.0, 45.0), 2.0),
+    "gpt-5.6-terra": (2.0, 0.2, 12.0, (4.0, 0.4, 18.0), 2.0),
+    "gpt-5.6-luna": (0.2, 0.02, 1.2, (0.4, 0.04, 1.8), 2.0),
+    "gpt-5.5": (5.0, 0.5, 30.0, (10.0, 1.0, 45.0), 2.5),
+}
+CODEX_LONG_CONTEXT_TOKENS = 272_000
+# 紀錄裡沒有實際模型的特殊名稱：auto-review 依 ccusage／Pane 的對照表推定 2026-04-23 起為 gpt-5.5（推定，未查證）；
+# gpt-reserve 依 OpenUsage 文件以 gpt-5.6-luna 計價。分模型明細仍顯示原名。
+CODEX_PRICING_ALIAS = {"codex-auto-review": "gpt-5.5", "gpt-reserve": "gpt-5.6-luna"}
+
+
+def codex_pricing_model(model):
+    base = CODEX_PRICING_ALIAS.get(model, model)
+    base = re.sub(r"-(\d{4}-\d{2}-\d{2}|\d{8})$", "", base)  # 去掉日期版號
+    fast = base.endswith("-fast")
+    base = base.removesuffix("-fast")
+    base = re.sub(r"-(none|minimal|low|medium|high|xhigh|max|ultra)$", "", base)  # 去掉推理強度後綴
+    return base, fast
+
+
+def codex_event_cost(model, inp, cached, out, is_fast):
+    base, alias_fast = codex_pricing_model(model)
+    price = CODEX_PRICES.get(base)
+    if not price:
+        return None
+    rin, rcache, rout, long_rates, fast_mult = price
+    if inp > CODEX_LONG_CONTEXT_TOKENS:  # 單次請求 input（含 cache）超過 272K，整個請求用長 context 單價
+        rin, rcache, rout = long_rates
+    cost = ((inp - cached) * rin + cached * rcache + out * rout) / 1_000_000
+    return cost * (fast_mult if is_fast or alias_fast else 1)
+
+
+def _iso_to_local_date(text):
+    try:
+        return datetime.datetime.fromisoformat(text.strip().replace("Z", "+00:00")).astimezone().date()
+    except (ValueError, AttributeError):
+        return None
+
+
+def _codex_is_child_session(payload):
+    """fork 或 subagent 產生的子 session：開頭會重播父 session 的 token 歷史，這段不能重複計費。"""
+    source = payload.get("source")
+    return bool(payload.get("forked_from_id") or payload.get("parent_thread_id")
+                or payload.get("thread_source") == "subagent"
+                or (isinstance(source, dict) and source.get("subagent")))
+
+
+def _codex_usage(u):
+    return {k: int(u.get(k) or 0) for k in
+            ("input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens", "total_tokens")}
+
+
+def parse_codex_session(path):
+    """讀一個 Codex session 檔，回傳 (是否為子 session, [(累計值簽章, 日期, 模型, input, cached, output, reasoning, is_fast)])。
+
+    子 session（fork／subagent）開頭會把父 session 的 token 歷史原封不動重播一遍，而且重播可能出現在子 session
+    自己的 task_started 之後（2026-09-28 實測），所以不能靠 task_started 判斷重播結束（Pane／CrossUsage 的做法，
+    會把重播算兩次）。改為：累計值簽章交給呼叫端跨檔案去重；子 session 在第一個 turn_context 之前的紀錄沒有模型、
+    必定是重播，直接略過（也涵蓋父 session 檔案已刪除的情況）。
+    """
+    events = []
+    prev_totals, current_model, is_fast, is_child, saw_meta = None, None, False, False, False
+    markers = ('"turn_context"', '"session_meta"', '"thread_settings_applied"', '"token_count"')
+    try:
+        f = open(path, encoding="utf-8", errors="replace")
+    except OSError:
+        return False, events
+    with f:
+        for line in f:
+            if not any(m in line for m in markers):
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            typ, p = obj.get("type"), obj.get("payload") or {}
+            if not isinstance(p, dict):
+                continue
+            if typ == "turn_context":
+                current_model = p.get("model") or p.get("model_name") or current_model
+                continue
+            if typ == "session_meta":
+                if not saw_meta:
+                    saw_meta = True
+                    is_child = _codex_is_child_session(p)
+                continue
+            if typ != "event_msg":
+                continue
+            ptype = p.get("type")
+            if ptype == "thread_settings_applied":
+                tier = ((p.get("thread_settings") or {}).get("service_tier") or p.get("service_tier") or "").strip()
+                if tier:
+                    is_fast = tier in ("fast", "priority")
+                continue
+            if ptype != "token_count":
+                continue
+            day = _iso_to_local_date(obj.get("timestamp"))
+            info = p.get("info") or {}
+            totals = _codex_usage(info["total_token_usage"]) if info.get("total_token_usage") else None
+            if day is None or (totals and totals == prev_totals):
+                continue
+            if info.get("last_token_usage"):
+                u = _codex_usage(info["last_token_usage"])
+            elif totals:
+                base = prev_totals or {}
+                u = {k: max(v - base.get(k, 0), 0) for k, v in totals.items()}
+            else:
+                continue
+            if totals:
+                prev_totals = totals
+            if not (u["input_tokens"] or u["cached_input_tokens"] or u["output_tokens"]):
+                continue
+            model = p.get("model") or info.get("model") or current_model
+            if is_child and not model:
+                continue  # 子 session 還沒有自己的回合：父 session 的重播
+            signature = tuple(sorted(totals.items())) if totals else None
+            cached = min(u["cached_input_tokens"], u["input_tokens"])
+            events.append((signature, day, model or "unknown", u["input_tokens"], cached, u["output_tokens"],
+                           u["reasoning_output_tokens"], is_fast))
+    return is_child, events
+
+
+def codex_events():
+    """所有 Codex 回合，跨檔案去重後回傳 [(日期, 模型, input, cached, output, reasoning, is_fast)] 與對話數。
+
+    sessions 與 archived_sessions 以檔名去重；同一個累計值簽章只算第一次出現，先處理一般 session 再處理子 session，
+    讓重播的用量歸給父 session（模型資訊也是父 session 的）。
+    """
+    home = os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
+    files = {}
+    for sub in ("sessions", "archived_sessions"):  # sessions 優先
+        for path in glob.glob(os.path.join(home, sub, "**", "*.jsonl"), recursive=True):
+            files.setdefault(os.path.basename(path), path)
+    parsed = sorted((parse_codex_session(path) for path in sorted(files.values())), key=lambda r: r[0])
+    seen, out, conversations = set(), [], 0
+    for _is_child, events in parsed:
+        kept = 0
+        for signature, *event in events:
+            if signature is not None:
+                if signature in seen:
+                    continue
+                seen.add(signature)
+            out.append(tuple(event))
+            kept += 1
+        conversations += kept > 0
+    return out, conversations
+
+
+def scan_codex_daily():
+    """回傳 (daily, 對話數)，daily 與 splitrail daily_stats 同形狀。"""
+    events, conversations = codex_events()
+    daily = {}
+    for day, model, inp, cached, out, reasoning, is_fast in events:
+        cost = codex_event_cost(model, inp, cached, out, is_fast) or 0.0
+        d = daily.setdefault(day.isoformat(), {"stats": {}, "model_stats": {}})
+        for target in (d["stats"], d["model_stats"].setdefault(model, {"model": model})):
+            target["inputTokens"] = target.get("inputTokens", 0) + inp - cached  # 與 splitrail 相同：input 不含 cache
+            target["cachedTokens"] = target.get("cachedTokens", 0) + cached
+            target["outputTokens"] = target.get("outputTokens", 0) + out
+            target["reasoningTokens"] = target.get("reasoningTokens", 0) + reasoning
+        d["stats"]["costCents"] = d["stats"].get("costCents", 0) + cost * 100
+        m = d["model_stats"][model]
+        m["cost"] = m.get("cost", 0) + cost
+    return daily, conversations
+
+
+def replace_analyzer_daily(data, name, daily, conversations):
+    """用自己算的每日資料取代 splitrail 對某個工具的結果（沒有紀錄時整個移除，不留錯的數字）。"""
+    stats = data.get("analyzer_stats", [])
+    entry = {"analyzer_name": name, "daily_stats": daily, "num_conversations": conversations}
+    pos = next((i for i, a in enumerate(stats) if a.get("analyzer_name") == name), None)
+    if pos is None:
+        stats.append(entry)
+    else:
+        stats[pos] = entry  # 原地替換，保持工具的顯示順序
+    if not daily:
+        stats.remove(entry)
+    data["analyzer_stats"] = stats
 
 
 def summarize(data, today):
@@ -589,7 +850,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <section class="card" id="spendCard">
       <div class="card-head">
         <select id="metric" aria-label="指標"></select>
-        <span class="info" title="花費是 splitrail 用本機 token 紀錄反推的 API 等價估算，不是官方帳單。Tokens 含 input、output 與 cached。">ⓘ</span>
+        <span class="info" title="花費是用本機紀錄的 token 數乘上官方 API 單價估算，不是官方帳單（Claude 由 splitrail 計算，Codex／Antigravity 由本儀表板自行計算）。Tokens 含 input、output 與 cached。">ⓘ</span>
       </div>
       <div class="tabs" id="tabs"></div>
       <div class="donut-row">
@@ -696,7 +957,7 @@ function renderSpend() {
   } else if (metric === "cost") {
     amountEl.textContent = total >= 1000 ? "$" + (total / 1000).toFixed(1) + "K" : "$" + total.toFixed(0);
     unitEl.textContent = "dollars";
-    centerEl.title = fmtMoneyExact(total) + "（splitrail 本機估算）";
+    centerEl.title = fmtMoneyExact(total) + "（本機紀錄估算）";
   } else if (metric === "tokens") {
     const big = total >= 1e9;
     amountEl.textContent = big ? (total / 1e9).toFixed(2) : (total / 1e6).toFixed(1);
@@ -708,7 +969,7 @@ function renderSpend() {
     const blended = cost / tokens * 1e6;
     amountEl.textContent = "$" + blended.toFixed(2);
     unitEl.textContent = "MTok";
-    centerEl.title = "整體平均 $" + blended.toFixed(4) + " / 百萬 tokens（splitrail 本機估算）";
+    centerEl.title = "整體平均 $" + blended.toFixed(4) + " / 百萬 tokens（本機紀錄估算）";
   }
 
   // 每段依佔比；再小的佔比也保留看得見的細條，最後等比縮放回整圈
@@ -822,6 +1083,12 @@ function renderMeters(el, p) {
       <div class="meter-reset">${esc(r.resetText)}</div>`;
     el.appendChild(m);
   });
+  if (q.note) {  // 資料來源提示（Pane 資料較舊、改用直讀等）
+    const note = document.createElement("div");
+    note.className = "meter-reset";
+    note.textContent = q.note;
+    el.appendChild(note);
+  }
 }
 
 // ---------- 每家卡片 ----------
@@ -837,7 +1104,7 @@ function trendHtml(p) {
       fill="${p.color}" opacity="${d.tokens ? 0.9 : 0.25}"><title>${d.date.slice(5)}　${d.tokens ? fmtTokens(d.tokens) + " tokens" : "No data"}</title></rect>`;
   }).join("");
   const range = `${p.trend[0].date.slice(5)} – ${p.trend[p.trend.length - 1].date.slice(5)}`;
-  return `<div class="trend" title="峰值 ${peak.date.slice(5)}：${fmtTokens(peak.tokens)} tokens（${range}，splitrail 本機紀錄）">
+  return `<div class="trend" title="峰值 ${peak.date.slice(5)}：${fmtTokens(peak.tokens)} tokens（${range}，本機紀錄）">
     <div class="trend-caption"><span>Usage Trend</span><span>峰值 ${fmtTokens(peak.tokens)}</span></div>
     <svg viewBox="0 0 300 36" preserveAspectRatio="none">${bars}</svg></div>`;
 }
@@ -892,8 +1159,6 @@ function renderProviders() {
   DATA.providers.forEach((p, i) => {
     const card = document.createElement("section");
     card.className = "card";
-    const hint = p.name === "Antigravity CLI"
-      ? `<div class="hint" title="Antigravity 的花費受 splitrail 本身的 bug 影響，數字偏低。">花費受 splitrail bug 影響，數字偏低</div>` : "";
     card.innerHTML = `
       <div class="prov-head"><span class="dot" style="background:${p.color}"></span>${esc(p.name)}${
         p.quota && p.quota.plan ? `<span class="plan">${esc(p.quota.plan)}</span>` : ""}</div>
@@ -901,8 +1166,8 @@ function renderProviders() {
       ${trendHtml(p)}
       <button class="caret" data-expand="prov${i}"><span>顯示更多</span><span class="chev">▾</span></button>
       <div class="expand" data-panel="prov${i}">
-        <div class="sub-title" title="splitrail 用本機紀錄估算；滑鼠移到數字上看分模型明細">花費（估算，移上看分模型）</div>
-        ${spendRowsHtml(p)}${grantsHtml(p)}${hint}
+        <div class="sub-title" title="用本機紀錄的 token 數乘上官方 API 單價估算，不是實際帳單；滑鼠移到數字上看分模型明細">花費（估算，移上看分模型）</div>
+        ${spendRowsHtml(p)}${grantsHtml(p)}
       </div>`;
     wrap.appendChild(card);
     meterEls.push([card.querySelector(".meters"), p]);
@@ -925,7 +1190,7 @@ document.getElementById("footer").textContent = "資料更新於 " + DATA.genera
 
 def build_html(providers, generated_at):
     payload = {"generated_at": generated_at, "providers": providers}
-    return HTML_TEMPLATE.replace("__DATA_JSON__", json.dumps(payload, ensure_ascii=False))
+    return HTML_TEMPLATE.replace("__DATA_JSON__", json.dumps(payload, ensure_ascii=False).replace("<", "\\u003c"))
 
 
 def main():
@@ -936,6 +1201,8 @@ def main():
             out_path = sys.argv[i + 1]
 
     data = run_splitrail()
+    replace_analyzer_daily(data, "Antigravity CLI", *scan_antigravity_daily())
+    replace_analyzer_daily(data, "Codex CLI", *scan_codex_daily())
     today = datetime.date.today()
     rows = summarize(data, today)
     print_table(rows, today)

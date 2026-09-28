@@ -5,13 +5,19 @@
 MTok／Tokens）、每家的訂閱額度條（5 小時／每週，含重置倒數與 pace 預估）、近 30 天用量趨勢、
 分模型花費明細。
 
-訂閱額度直接查官方用量 API，不經過 splitrail：Claude 用 Claude Code CLI 的
-`~/.claude/.credentials.json`、Codex 用 `~/.codex/auth.json`（token 過期時卡片會提示，在終端機
-跑一次該 CLI 即可刷新）；Antigravity 只在 App 或 `agy` 執行中才抓得到。
+**訂閱額度由 [Pane](https://github.com/ItsJazii/pane) 提供**（OpenUsage 的 Windows 版）：儀表板讀
+Pane 的本機 API `http://127.0.0.1:6736/v1/usage`，Pane 沒開時額度卡片會提示。Claude／Codex 的
+token 換新由 Pane 負責，本儀表板**不讀寫任何登入憑證**，避免兩個程式同時換 token 互相作廢。
+Antigravity 額度若 Pane 抓不到，改由儀表板直接讀 Antigravity 的本機服務（App 或 `agy` 執行中才有）。
 
-費用是用本機 token 記錄反推的**估算值**，不是官方帳單金額，只拿來看相對趨勢，
-對帳請以官方帳單為準。Antigravity CLI 的用量目前因上游 [splitrail](https://github.com/Piebald-AI/splitrail)
-本身的一個 bug（idx 誤配，metadata 綁在 user step 上時被漏算）而不準確。
+費用是本機 token 紀錄乘上官方 API 單價的**估算值**，不是官方帳單金額，只拿來看相對趨勢：
+- **Claude Code**：由 [splitrail](https://github.com/Piebald-AI/splitrail) 計算。
+- **Codex CLI**：自行讀 `~/.codex/sessions`，含 fast（priority）加價、fork／subagent 子 session 去重、
+  超過 272K input 的長 context 單價。splitrail 這三項都沒處理；子 session 重播改用跨檔案累計值去重（Pane 會重複計算）。
+- **Antigravity**：自行讀 `~/.gemini/antigravity*/conversations`（CLI、IDE、App 都算）。splitrail 3.10.1
+  把 token 欄位解讀錯誤且只讀 CLI，數字不可用。
+- 單價寫在 `splitrail-summary.py` 的 `CODEX_PRICES`／`GEMINI_PRICES`，依官方價目頁核對（2026-09-28）；
+  `codex-auto-review` 紀錄裡沒有實際模型，依推定以 gpt-5.5 計價。
 
 ## 安裝（Windows）
 
@@ -23,6 +29,8 @@ MTok／Tokens）、每家的訂閱額度條（5 小時／每週，含重置倒�
    ```
    或直接去 [splitrail Releases](https://github.com/Piebald-AI/splitrail/releases) 手動下載對應平台的壓縮檔。
 2. 確認電腦已安裝 Python 3（含 `python` 指令可在任何路徑直接呼叫）。
+3. 安裝並開啟 [Pane](https://github.com/ItsJazii/pane/releases)（per-user 安裝，不需系統管理員），
+   在 Pane 裡啟用 Claude、Codex、Antigravity。
 
 ## 使用
 
