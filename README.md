@@ -23,6 +23,8 @@ App 或 `agy` 執行中才抓得到。
 - 單價寫在 `splitrail-summary.py` 的 `CODEX_PRICES`／`GEMINI_PRICES`，依官方價目頁核對（2026-09-28）；
   `codex-auto-review` 紀錄裡沒有實際模型，依推定以 gpt-5.5 計價。
 
+系統需求、逐項測試步驟、疑難排解與安全須知見 [docs/環境與測試說明.md](docs/環境與測試說明.md)。
+
 ## 安裝（Windows）
 
 1. 這個資料夾需要 [splitrail](https://github.com/Piebald-AI/splitrail) 的執行檔。用
@@ -58,3 +60,9 @@ App 或 `agy` 執行中才抓得到。
 | `splitrail-summary.py` | 主邏輯：跑 `splitrail.exe stats`、彙總 JSON、印表格、產生視覺化 HTML |
 | `splitrail-summary.bat` / `splitrail-dashboard.bat` | 免打 `python` 的捷徑（路徑皆為相對於自身所在資料夾，可攜） |
 | `splitrail-dashboard-loop.bat` | 背景定時更新迴圈 |
+| `docs/環境與測試說明.md` | 系統需求、測試步驟、疑難排解、安全須知 |
+
+## 授權
+
+[MIT License](LICENSE)。splitrail 為 [Piebald-AI/splitrail](https://github.com/Piebald-AI/splitrail) 的獨立專案，
+需另外下載，不包含在本 repo 內。Antigravity／Codex 的讀取方式參考 [OpenUsage](https://github.com/robinebers/openusage)（MIT）。

@@ -25,11 +25,8 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def find_splitrail_exe():
-    """優先找腳本同層目錄的 splitrail.exe，找不到才退回 PATH。"""
-    local = os.path.join(SCRIPT_DIR, "splitrail.exe")
-    if os.path.isfile(local):
-        return local
-    return "splitrail.exe"
+    """只用腳本同層目錄的 splitrail.exe（不退回用名稱在 PATH／目前資料夾尋找，避免誤執行同名的其他程式）。"""
+    return os.path.join(SCRIPT_DIR, "splitrail.exe")
 
 
 SPLITRAIL_EXE = find_splitrail_exe()
@@ -300,6 +297,10 @@ Next
 '''
 
 
+# Windows 內建工具一律用完整路徑呼叫：用名稱呼叫時 Windows 會先找目前資料夾，可能誤執行同名的其他程式
+SYSTEM32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+
+
 def _run_text(cmd, **kw):
     try:
         return subprocess.run(cmd, capture_output=True, encoding="mbcs", errors="replace", timeout=10, **kw).stdout or ""
@@ -314,22 +315,31 @@ def find_antigravity_targets():
     language server 要帶啟動參數裡的 --csrf_token。用 cscript+WMI 讀命令列，因為 EDR 會擋子行程叫 powershell。
     """
     pid_token = {}
-    for m in re.finditer(r'"agy\.exe","(\d+)"', _run_text('tasklist /FI "IMAGENAME eq agy.exe" /FO CSV /NH', shell=True)):
+    tasklist = _run_text([os.path.join(SYSTEM32, "tasklist.exe"), "/FI", "IMAGENAME eq agy.exe", "/FO", "CSV", "/NH"])
+    for m in re.finditer(r'"agy\.exe","(\d+)"', tasklist):
         pid_token[m[1]] = None
-    vbs = os.path.join(tempfile.gettempdir(), "splitrail-lsproc.vbs")
+    # 每次用不重複的暫存檔名，執行完就刪除（固定檔名可能在寫入與執行之間被換掉）
+    vbs = None
     try:
-        with open(vbs, "w", newline="\r\n") as f:
+        fd, vbs = tempfile.mkstemp(prefix="splitrail-lsproc-", suffix=".vbs")
+        with os.fdopen(fd, "w", newline="\r\n") as f:
             f.write(AGY_PROC_VBS)
-        for line in _run_text(["cscript", "//nologo", vbs]).splitlines():
+        for line in _run_text([os.path.join(SYSTEM32, "cscript.exe"), "//nologo", vbs]).splitlines():
             pid, _, cmd = line.partition("|")
             tok = re.search(r"--csrf_token[= ]+([0-9a-fA-F-]+)", cmd)
             if pid.strip().isdigit() and tok:
                 pid_token[pid.strip()] = tok[1]
     except OSError:
         pass
+    finally:
+        if vbs:
+            try:
+                os.remove(vbs)
+            except OSError:
+                pass
     if not pid_token:
         return []
-    netstat = _run_text("netstat -ano -p TCP", shell=True)
+    netstat = _run_text([os.path.join(SYSTEM32, "netstat.exe"), "-ano", "-p", "TCP"])
     return [(m[1], pid_token[m[2]])
             for m in re.finditer(r"^\s*TCP\s+127\.0\.0\.1:(\d+)\s+\S+\s+LISTENING\s+(\d+)\s*$", netstat, re.M)
             if m[2] in pid_token]
