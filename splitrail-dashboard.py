@@ -1352,13 +1352,10 @@ def build_html(providers, generated_at):
     return HTML_TEMPLATE.replace("__DATA_JSON__", json.dumps(payload, ensure_ascii=False).replace("<", "\\u003c"))
 
 
-def main():
-    want_html = "--html" in sys.argv
-    out_path = None
-    for i, arg in enumerate(sys.argv):
-        if arg == "--html" and i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith("-"):
-            out_path = sys.argv[i + 1]
+LOOP_SECONDS = 300  # --loop 的更新間隔，與網頁的自動重新載入間隔一致
 
+
+def generate(want_html, out_path, open_browser):
     data = run_splitrail()
     replace_analyzer_daily(data, "Antigravity CLI", *scan_antigravity_daily())
     replace_analyzer_daily(data, "Codex CLI", *scan_codex_daily())
@@ -1373,8 +1370,28 @@ def main():
         with open(path, "w", encoding="utf-8") as f:
             f.write(html)
         print(f"\n已產生視覺化頁面：{path}")
-        if "--no-open" not in sys.argv:
+        if open_browser:
             webbrowser.open("file:///" + path.replace("\\", "/"))
+
+
+def main():
+    # 預設：印表格＋產生網頁並開啟；--text 只印表格；--no-open 不開瀏覽器；
+    # --loop 每 5 分鐘在背景重新產生網頁；--html <路徑> 指定網頁輸出位置
+    want_html = "--text" not in sys.argv
+    out_path = None
+    for i, arg in enumerate(sys.argv):
+        if arg == "--html" and i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith("-"):
+            out_path = sys.argv[i + 1]
+
+    if "--loop" not in sys.argv:
+        generate(want_html, out_path, "--no-open" not in sys.argv)
+        return
+    while True:
+        try:
+            generate(True, out_path, False)
+        except (Exception, SystemExit) as e:  # 單次失敗（例如 splitrail 暫時出錯）不中斷迴圈
+            print(f"本次更新失敗：{e!r}", file=sys.stderr)
+        time.sleep(LOOP_SECONDS)
 
 
 if __name__ == "__main__":
