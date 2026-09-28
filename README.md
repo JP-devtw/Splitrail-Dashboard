@@ -5,6 +5,8 @@
 MTok／Tokens）、每家的訂閱額度條（5 小時／每週，含重置倒數與 pace 預估）、近 30 天用量趨勢、
 分模型花費明細。
 
+![儀表板截圖（示範資料）](docs/screenshot.png)
+
 **訂閱額度直接查官方用量 API**，不需要另外開程式：Claude 用 Claude Code CLI 的
 `~/.claude/.credentials.json`，token 過期時由本儀表板自動換新並寫回（寫入前備份到同目錄的
 `.credentials.json.splitrail-bak`；若顯示「登入已失效」請執行 `claude auth login`）；Codex 用
