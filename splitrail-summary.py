@@ -16,6 +16,7 @@ import sys
 import datetime
 import glob
 import sqlite3
+import time
 import urllib.error
 import urllib.request
 import webbrowser
@@ -93,6 +94,30 @@ def fetch_pane_usage():
         except (urllib.error.URLError, OSError, ValueError):
             _pane_cache["data"] = None
     return _pane_cache["data"]
+
+
+def ensure_pane_running(timeout=40):
+    """Pane 沒開就啟動它，並等到它的 API 有資料（剛啟動的前十幾秒 API 會回空陣列）。"""
+    def ready():
+        _pane_cache.clear()
+        return bool(fetch_pane_usage())
+    if ready():
+        return
+    exe = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Pane", "pane.exe")
+    if not os.path.isfile(exe):
+        print("找不到 Pane（%LOCALAPPDATA%\\Pane\\pane.exe），額度卡片會是空的", file=sys.stderr)
+        return
+    if fetch_pane_usage() is None:  # API 連不上＝Pane 沒在執行；有連上但還沒資料就只等待
+        print("啟動 Pane…")
+        subprocess.Popen([exe], creationflags=getattr(subprocess, "DETACHED_PROCESS", 0), close_fds=True)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(2)
+        if ready():
+            print("Pane 已就緒")
+            return
+    _pane_cache.clear()
+    print(f"等了 {timeout} 秒 Pane 仍沒有資料，額度卡片可能是空的", file=sys.stderr)
 
 
 def pane_quota(name):
@@ -1208,6 +1233,8 @@ def main():
     print_table(rows, today)
 
     if want_html:
+        if "--no-open" not in sys.argv:
+            ensure_pane_running()  # 只在手動開網頁時啟動 Pane；背景更新（--no-open）不會，免得關掉的 Pane 又被打開
         providers = build_providers(data, today)
         html = build_html(providers, datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
         path = out_path or os.path.join(SCRIPT_DIR, "splitrail-dashboard.html")
