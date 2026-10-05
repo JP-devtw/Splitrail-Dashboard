@@ -286,7 +286,11 @@ def fetch_codex_quota():
         return {"error": "Codex 額度 API 回應中沒有額度窗資料"}
     windows.sort(key=lambda w: w["secs"])  # 短窗在上，跟 Claude 卡片同順序
     plan = data.get("plan_type")
-    return {"windows": windows, "plan": plan.capitalize() if isinstance(plan, str) and plan else None}
+    # 額度重置券：API 只給張數、沒有每張的期限，所以只顯示張數（沒有 items 就不出現滑鼠提示）
+    credits = data.get("rate_limit_reset_credits")
+    grants = {"count": int(credits.get("available_count") or 0), "items": []} if isinstance(credits, dict) else None
+    return {"windows": windows, "grants": grants,
+            "plan": plan.capitalize() if isinstance(plan, str) and plan else None}
 
 
 AGY_PROC_VBS = r'''Set wmi = GetObject("winmgmts:\\.\root\cimv2")
@@ -1045,9 +1049,9 @@ const store = {
 const PERIODS = [["today", "Today"], ["yesterday", "Yesterday"], ["last30", "30 Days"]];
 const METRICS = { cost: "Cost", cpm: "Cost per MTok", tokens: "Tokens" };
 let period = store.get("period", "last30");
-let metric = store.get("metric", "cost");
+let metric = store.get("metric", "tokens");
 if (!PERIODS.some(p => p[0] === period)) period = "last30";
-if (!METRICS[metric]) metric = "cost";
+if (!METRICS[metric]) metric = "tokens";
 const BLUE = "#4C8DF6", YELLOW = "#E5A54B", RED = "#E5484D";
 const CIRC = 2 * Math.PI * 58;
 
