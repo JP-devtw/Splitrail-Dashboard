@@ -44,12 +44,13 @@ App 或 `agy` 執行中才抓得到。
 
 | 指令 | 效果 |
 | :-- | :-- |
-| `splitrail-dashboard.bat` | 產生 `splitrail-dashboard.html` 並自動用瀏覽器打開 |
+| `splitrail-dashboard.bat` | 開本機伺服器並用瀏覽器打開 `http://127.0.0.1:8765/`：網頁每 5 分鐘、或按瀏覽器重新整理時，都會在背景重抓資料（約 5–20 秒），抓完自動換上新資料；關掉視窗即停止。改埠用 `--serve --port <埠號>` |
+| `splitrail-dashboard.bat --once` | 只產生一次 `splitrail-dashboard.html` 並用瀏覽器打開（不開伺服器，重新整理不會更新資料） |
 | `splitrail-dashboard.bat --text` | 只印文字表格（各工具的累計/近7天/近30天/今日費用與 token） |
 | `splitrail-dashboard.bat --no-open` | 只產生 HTML，不自動開瀏覽器 |
 | `splitrail-dashboard.bat --loop` | 背景常駐，每 5 分鐘靜默更新一次網頁（開著的網頁也會每 5 分鐘自動重新載入） |
 
-`.bat` 只是免打 `python` 的捷徑，主程式是 `splitrail-dashboard.py`（只用標準函式庫）。
+`.bat` 只是免打 `python` 的捷徑（不加參數時自動帶 `--serve`），主程式是 `splitrail-dashboard.py`（只用標準函式庫）。
 
 **開機自動更新（選用）**：沒有系統管理員權限、不能用工作排程器時，在 Windows 個人啟動資料夾
 （`Win+R` 輸入 `shell:startup`）放一個內容為

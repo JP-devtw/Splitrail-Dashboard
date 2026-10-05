@@ -1341,21 +1341,34 @@ renderProviders();
 renderAllMeters();
 setInterval(renderAllMeters, 30000);  // 倒數與 pace 每 30 秒更新；整頁每 5 分鐘重新載入新資料
 document.getElementById("footer").textContent = "資料更新於 " + DATA.generated_at + " · 每 5 分鐘自動重新整理";
+
+// --serve 模式：每次載入頁面（含每 5 分鐘自動重新載入、手動按重新整理）都請伺服器在背景重抓資料，
+// 抓完自動換上新資料（重抓約需 20 秒，期間先顯示舊資料）。直接開 html 檔時不做任何事。
+if (location.protocol.startsWith("http") && DATA.stamp) {
+  const footer = document.getElementById("footer");
+  const base = footer.textContent;
+  const poll = () => fetch("status").then(r => r.json()).then(s => {
+    if (s.stamp !== DATA.stamp) return location.reload();
+    footer.textContent = base + (s.refreshing ? " · 正在更新資料…" : s.error ? " · 更新失敗：" + s.error : "");
+    if (s.refreshing) setTimeout(poll, 2000);
+  }).catch(() => { footer.textContent = base + " · 連不到本機伺服器，資料不會再更新"; });
+  fetch("refresh", { method: "POST" }).then(poll, poll);
+}
 </script>
 </body>
 </html>
 """
 
 
-def build_html(providers, generated_at):
-    payload = {"generated_at": generated_at, "providers": providers}
+def build_html(providers, generated_at, stamp=None):
+    payload = {"generated_at": generated_at, "providers": providers, "stamp": stamp}
     return HTML_TEMPLATE.replace("__DATA_JSON__", json.dumps(payload, ensure_ascii=False).replace("<", "\\u003c"))
 
 
 LOOP_SECONDS = 300  # --loop 的更新間隔，與網頁的自動重新載入間隔一致
 
 
-def generate(want_html, out_path, open_browser):
+def generate(want_html, out_path, open_browser, stamp=None):
     data = run_splitrail()
     replace_analyzer_daily(data, "Antigravity CLI", *scan_antigravity_daily())
     replace_analyzer_daily(data, "Codex CLI", *scan_codex_daily())
@@ -1365,23 +1378,110 @@ def generate(want_html, out_path, open_browser):
 
     if want_html:
         providers = build_providers(data, today)
-        html = build_html(providers, datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
+        html = build_html(providers, datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), stamp)
         path = out_path or os.path.join(SCRIPT_DIR, "splitrail-dashboard.html")
         with open(path, "w", encoding="utf-8") as f:
             f.write(html)
         print(f"\n已產生視覺化頁面：{path}")
         if open_browser:
             webbrowser.open("file:///" + path.replace("\\", "/"))
+        return html
+
+
+SERVE_PORT = 8765
+REFRESH_MIN_SECONDS = 30  # 上次更新完不到 30 秒就不重抓，避免連按重新整理狂打官方額度 API
+
+
+def serve(out_path, port):
+    """本機網頁伺服器：網頁每次載入都會 POST /refresh，這裡在背景重新產生資料，網頁輪詢 /status 等新資料。"""
+    import http.server
+    import threading
+
+    state = {"html": None, "stamp": None, "done_at": 0.0, "refreshing": False, "error": None}
+    lock = threading.Lock()
+    first_ready = threading.Event()
+
+    def worker():
+        try:
+            stamp = str(time.time_ns())
+            html = generate(True, out_path, False, stamp)
+            with lock:
+                state.update(html=html.encode("utf-8"), stamp=stamp, error=None)
+        except (Exception, SystemExit) as e:  # 單次失敗不讓伺服器掛掉，錯誤顯示在網頁頁尾
+            print(f"本次更新失敗：{e!r}", file=sys.stderr)
+            with lock:
+                state["error"] = str(e) or repr(e)
+        finally:
+            with lock:
+                state.update(refreshing=False, done_at=time.time())
+            first_ready.set()
+
+    def start_refresh():
+        with lock:
+            if state["refreshing"] or time.time() - state["done_at"] < REFRESH_MIN_SECONDS:
+                return
+            state["refreshing"] = True
+        threading.Thread(target=worker, daemon=True).start()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def send(self, code, body, ctype):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path == "/":
+                first_ready.wait()
+                with lock:
+                    html = state["html"]
+                if html is None:
+                    self.send(500, f"第一次產生資料就失敗：{state['error']}".encode("utf-8"), "text/plain; charset=utf-8")
+                else:
+                    self.send(200, html, "text/html; charset=utf-8")
+            elif self.path == "/status":
+                with lock:
+                    body = {k: state[k] for k in ("stamp", "refreshing", "error")}
+                self.send(200, json.dumps(body, ensure_ascii=False).encode("utf-8"), "application/json")
+            else:
+                self.send(404, b"not found", "text/plain")
+
+        def do_POST(self):
+            if self.path != "/refresh":
+                return self.send(404, b"not found", "text/plain")
+            start_refresh()
+            self.send(204, b"", "text/plain")
+
+        def log_message(self, *args):  # 不印每一筆請求，避免洗掉用量表格
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)  # 只聽本機，區網連不進來
+    url = f"http://127.0.0.1:{port}/"
+    print(f"儀表板伺服器啟動：{url}（關閉這個視窗即停止）")
+    start_refresh()
+    if "--no-open" not in sys.argv:
+        webbrowser.open(url)
+    server.serve_forever()
 
 
 def main():
     # 預設：印表格＋產生網頁並開啟；--text 只印表格；--no-open 不開瀏覽器；
-    # --loop 每 5 分鐘在背景重新產生網頁；--html <路徑> 指定網頁輸出位置
+    # --loop 每 5 分鐘在背景重新產生網頁；--html <路徑> 指定網頁輸出位置；
+    # --serve 開本機網頁伺服器，網頁定時或按重新整理時即時重抓資料（--port <埠號> 改埠，預設 8765）
+    # （.bat 不加參數時自動帶 --serve；--once 只是讓 .bat 走這裡的預設行為，本身不做任何事）
     want_html = "--text" not in sys.argv
     out_path = None
+    port = SERVE_PORT
     for i, arg in enumerate(sys.argv):
         if arg == "--html" and i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith("-"):
             out_path = sys.argv[i + 1]
+        if arg == "--port" and i + 1 < len(sys.argv) and sys.argv[i + 1].isdigit():
+            port = int(sys.argv[i + 1])
+
+    if "--serve" in sys.argv:
+        serve(out_path, port)
+        return
 
     if "--loop" not in sys.argv:
         generate(want_html, out_path, "--no-open" not in sys.argv)
