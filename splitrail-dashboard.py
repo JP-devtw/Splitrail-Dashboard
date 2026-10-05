@@ -11,6 +11,7 @@ import os
 import re
 import ssl
 import subprocess
+import concurrent.futures
 import tempfile
 import sys
 import datetime
@@ -404,7 +405,7 @@ QUOTA_FETCHERS = {
 }
 
 
-def build_providers(data, today):
+def build_providers(data, today, quotas=None):
     """整理成 HTML 用的每家資料：Today/Yesterday/30 Days 花費與 token（含分模型）、近 30 天每日趨勢。
 
     tokens 一律算 input+output+cached（實際處理量）；30 Days＝含今天往回 30 天。
@@ -454,7 +455,8 @@ def build_providers(data, today):
             "color": COLORS.get(name, DEFAULT_COLOR),
             "spend": spend,
             "trend": trend,
-            "quota": QUOTA_FETCHERS[name]() if name in QUOTA_FETCHERS else None,
+            "quota": (quotas[name] if quotas and name in quotas
+                      else QUOTA_FETCHERS[name]() if name in QUOTA_FETCHERS else None),
         })
     return providers
 
@@ -543,37 +545,69 @@ def gemini_cost(model, day, inp, out, cache):
     return (inp * price[0] + out * price[1] + cache * price[2]) / 1_000_000
 
 
+def _file_sig(*paths):
+    """檔案的 (修改時間, 大小) 簽章，用來判斷快取是否還有效；檔案不存在記為 None。"""
+    sig = []
+    for p in paths:
+        try:
+            st = os.stat(p)
+            sig.append((st.st_mtime_ns, st.st_size))
+        except OSError:
+            sig.append(None)
+    return tuple(sig)
+
+
+# 每個檔案上次的解析結果 {路徑: (簽章, 結果)}。--serve／--loop 時程式常駐，沒變動的舊紀錄檔不必每次重讀
+_ANTIGRAVITY_DB_CACHE = {}
+_CODEX_SESSION_CACHE = {}
+
+
+def parse_antigravity_db(db):
+    """讀一個對話 db，回傳 [(日期, 模型, input, output, cache)]；讀不了回傳 None。"""
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        cols = [r[1] for r in con.execute("PRAGMA table_info(steps)")]
+        step_meta = dict(con.execute("SELECT idx, metadata FROM steps")) if "metadata" in cols else {}
+        rows = con.execute("SELECT idx, data FROM gen_metadata WHERE data IS NOT NULL").fetchall()
+        con.close()
+    except sqlite3.Error:
+        return None
+    records = []
+    for idx, data in rows:
+        event = _pb_get(data, 1, 2)
+        usage = _pb_get(event, 4, 2)
+        if not usage:
+            continue
+        u = {n: v for n, w, v in _pb_fields(usage) if w == 0}
+        inp, out, cache = u.get(1, 0) + u.get(2, 0), u.get(3, 0), u.get(5, 0)
+        if not (u.get(2) or out or cache):
+            continue  # 只有系統提示數的簿記紀錄，不是一次生成（同 OpenUsage）
+        ts = _pb_get(_pb_get(_pb_get(event, 9, 2), 4, 2), 1, 0) or _pb_get(_pb_get(step_meta.get(idx), 1, 2), 1, 0)
+        if not ts:
+            continue
+        model_id = (_pb_get(event, 19, 2) or b"").decode("utf-8", "replace")
+        label = (_pb_get(event, 21, 2) or b"").decode("utf-8", "replace")
+        records.append((datetime.datetime.fromtimestamp(ts).date(), gemini_canonical(model_id, label), inp, out, cache))
+    return records
+
+
 def scan_antigravity_daily():
     """回傳 (daily, 對話數)：daily 與 splitrail daily_stats 同形狀 {日期: {"stats", "model_stats"}}；
     每個 .db 是一段對話。讀不了的 db 略過。"""
     daily, conversations = {}, set()
     root = os.path.join(os.path.expanduser("~"), ".gemini")
     for db in glob.glob(os.path.join(root, "antigravity*", "conversations", "**", "*.db"), recursive=True):
-        try:
-            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-            cols = [r[1] for r in con.execute("PRAGMA table_info(steps)")]
-            step_meta = dict(con.execute("SELECT idx, metadata FROM steps")) if "metadata" in cols else {}
-            rows = con.execute("SELECT idx, data FROM gen_metadata WHERE data IS NOT NULL").fetchall()
-            con.close()
-        except sqlite3.Error:
-            continue
-        for idx, data in rows:
-            event = _pb_get(data, 1, 2)
-            usage = _pb_get(event, 4, 2)
-            if not usage:
+        sig = _file_sig(db, db + "-wal")  # 新寫入可能還在 -wal 檔、主檔沒變，兩個都要比
+        cached = _ANTIGRAVITY_DB_CACHE.get(db)
+        if cached and cached[0] == sig:
+            records = cached[1]
+        else:
+            records = parse_antigravity_db(db)
+            if records is None:
                 continue
-            u = {n: v for n, w, v in _pb_fields(usage) if w == 0}
-            inp, out, cache = u.get(1, 0) + u.get(2, 0), u.get(3, 0), u.get(5, 0)
-            if not (u.get(2) or out or cache):
-                continue  # 只有系統提示數的簿記紀錄，不是一次生成（同 OpenUsage）
-            ts = _pb_get(_pb_get(_pb_get(event, 9, 2), 4, 2), 1, 0) or _pb_get(_pb_get(step_meta.get(idx), 1, 2), 1, 0)
-            if not ts:
-                continue
-            day = datetime.datetime.fromtimestamp(ts).date()
+            _ANTIGRAVITY_DB_CACHE[db] = (sig, records)
+        for day, model, inp, out, cache in records:
             conversations.add(db)
-            model_id = (_pb_get(event, 19, 2) or b"").decode("utf-8", "replace")
-            label = (_pb_get(event, 21, 2) or b"").decode("utf-8", "replace")
-            model = gemini_canonical(model_id, label)
             cost = gemini_cost(model, day, inp, out, cache) or 0.0
             d = daily.setdefault(day.isoformat(), {"stats": {}, "model_stats": {}})
             for target in (d["stats"], d["model_stats"].setdefault(model, {"model": model})):
@@ -723,6 +757,17 @@ def parse_codex_session(path):
     return is_child, events
 
 
+def parse_codex_session_cached(path):
+    """同 parse_codex_session，但檔案沒變動（修改時間與大小相同）就沿用上次的結果。"""
+    sig = _file_sig(path)
+    cached = _CODEX_SESSION_CACHE.get(path)
+    if cached and cached[0] == sig:
+        return cached[1]
+    result = parse_codex_session(path)
+    _CODEX_SESSION_CACHE[path] = (sig, result)
+    return result
+
+
 def codex_events():
     """所有 Codex 回合，跨檔案去重後回傳 [(日期, 模型, input, cached, output, reasoning, is_fast)] 與對話數。
 
@@ -734,7 +779,7 @@ def codex_events():
     for sub in ("sessions", "archived_sessions"):  # sessions 優先
         for path in glob.glob(os.path.join(home, sub, "**", "*.jsonl"), recursive=True):
             files.setdefault(os.path.basename(path), path)
-    parsed = sorted((parse_codex_session(path) for path in sorted(files.values())), key=lambda r: r[0])
+    parsed = sorted((parse_codex_session_cached(path) for path in sorted(files.values())), key=lambda r: r[0])
     seen, out, conversations = set(), [], 0
     for _is_child, events in parsed:
         kept = 0
@@ -1373,15 +1418,22 @@ LOOP_SECONDS = 300  # --loop 的更新間隔，與網頁的自動重新載入間
 
 
 def generate(want_html, out_path, open_browser, stamp=None):
-    data = run_splitrail()
-    replace_analyzer_daily(data, "Antigravity CLI", *scan_antigravity_daily())
-    replace_analyzer_daily(data, "Codex CLI", *scan_codex_daily())
+    # 各步驟互不相依，同時跑：splitrail 是外部程式、額度查詢是網路請求，等待時不佔 Python
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        splitrail_job = pool.submit(run_splitrail)
+        antigravity_job = pool.submit(scan_antigravity_daily)
+        codex_job = pool.submit(scan_codex_daily)
+        quota_jobs = {name: pool.submit(f) for name, f in QUOTA_FETCHERS.items()} if want_html else {}
+        data = splitrail_job.result()  # splitrail 失敗時的 sys.exit 會在這裡重新拋出，行為同以前
+        replace_analyzer_daily(data, "Antigravity CLI", *antigravity_job.result())
+        replace_analyzer_daily(data, "Codex CLI", *codex_job.result())
+        quotas = {name: job.result() for name, job in quota_jobs.items()}
     today = datetime.date.today()
     rows = summarize(data, today)
     print_table(rows, today)
 
     if want_html:
-        providers = build_providers(data, today)
+        providers = build_providers(data, today, quotas)
         html = build_html(providers, datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), stamp)
         path = out_path or os.path.join(SCRIPT_DIR, "splitrail-dashboard.html")
         with open(path, "w", encoding="utf-8") as f:
