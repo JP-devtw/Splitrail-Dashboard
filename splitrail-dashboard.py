@@ -1048,9 +1048,9 @@ const store = {
 };
 const PERIODS = [["today", "Today"], ["yesterday", "Yesterday"], ["last30", "30 Days"]];
 const METRICS = { cost: "Cost", cpm: "Cost per MTok", tokens: "Tokens" };
-let period = store.get("period", "last30");
+let period = store.get("period", "today");
 let metric = store.get("metric", "tokens");
-if (!PERIODS.some(p => p[0] === period)) period = "last30";
+if (!PERIODS.some(p => p[0] === period)) period = "today";
 if (!METRICS[metric]) metric = "tokens";
 const BLUE = "#4C8DF6", YELLOW = "#E5A54B", RED = "#E5484D";
 const CIRC = 2 * Math.PI * 58;
