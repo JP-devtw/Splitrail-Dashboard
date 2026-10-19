@@ -375,7 +375,8 @@ def antigravity_windows(groups, name_key, frac_key, reset_key):
                 "not_started": pct == 0 and secs < 604800,
             })
         windows += sorted(pool_windows, key=lambda w: w["secs"])  # 短窗在上
-    return windows
+    # Google 自家模型（Gemini、Argon）排在一起放前面，Claude/GPT 放後面；同組維持原本順序
+    return sorted(windows, key=lambda w: w["label"].startswith("Claude/GPT"))
 
 
 def fetch_antigravity_cli_quota():
