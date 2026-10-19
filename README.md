@@ -10,8 +10,8 @@ MTok／Tokens）、每家的訂閱額度條（5 小時／每週，含重置倒�
 **訂閱額度直接查官方用量 API**，不需要另外開程式：Claude 用 Claude Code CLI 的
 `~/.claude/.credentials.json`，token 過期時由本儀表板自動換新並寫回（寫入前備份到同目錄的
 `.credentials.json.splitrail-bak`；若顯示「登入已失效」請執行 `claude auth login`）；Codex 用
-`~/.codex/auth.json`（token 失效時卡片會提示，在終端機跑一次 codex 即可刷新）；Antigravity 只在
-App 或 `agy` 執行中才抓得到。
+`~/.codex/auth.json`（token 失效時卡片會提示，在終端機跑一次 codex 即可刷新）；Antigravity 用
+`agy -p /usage`（agy 不必開著、不花額度），沒裝 agy CLI 時改讀執行中的 Antigravity App。
 
 > ⚠ **不要同時執行其他也會換 Claude token 的工具**（例如 Pane、OpenUsage）：refresh token 用過即作廢，
 > 兩個程式同時換新會互相作廢，Claude Code CLI 會被迫重新登入。

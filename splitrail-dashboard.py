@@ -9,6 +9,7 @@ Codex／Antigravity 自行計算），不是官方帳單金額，
 import json
 import os
 import re
+import shutil
 import ssl
 import subprocess
 import concurrent.futures
@@ -316,7 +317,8 @@ def _run_text(cmd, **kw):
 def find_antigravity_targets():
     """找 agy CLI / Antigravity IDE language server 開在 127.0.0.1 的埠。回傳 [(port, csrf_token 或 None)]。
 
-    移植自 ai_usage_dashboard/server.js（Windows 實測過）：agy CLI 不需 token；IDE 的
+    移植自 ai_usage_dashboard/server.js（Windows 實測過）：agy 1.4.2 起 CLI 也要 token 而外部拿不到（回 401，
+    所以 CLI 改走 fetch_antigravity_cli_quota）；IDE 的
     language server 要帶啟動參數裡的 --csrf_token。用 cscript+WMI 讀命令列，因為 EDR 會擋子行程叫 powershell。
     """
     pid_token = {}
@@ -350,14 +352,64 @@ def find_antigravity_targets():
             if m[2] in pid_token]
 
 
-def fetch_antigravity_quota():
-    """查 Antigravity 額度：只在 agy CLI 或 Antigravity App 執行中才抓得到（讀它的本機服務）。
+def antigravity_windows(groups, name_key, frac_key, reset_key):
+    """把 Antigravity 的 groups[].buckets[] 換成額度條。CLI 與本機服務的欄位名稱不同，由呼叫端指定。"""
+    windows = []
+    for g in groups:
+        # 池：Gemini Models、Claude and GPT models（名稱照 OpenUsage 簡稱）；Gemini 4 Argon 另有獨立週額度
+        name = g.get(name_key) or ""
+        pool = ("Argon" if re.search("argon", name, re.I)
+                else "Gemini" if re.search("gemini", name, re.I) else "Claude/GPT")
+        pool_windows = []
+        for b in g.get("buckets") or []:
+            if b.get(frac_key) is None:
+                continue
+            secs = {"weekly": 604800, "daily": 86400}.get(b.get("window"), 18000)
+            pct = round((1 - b[frac_key]) * 100, 1)
+            pool_windows.append({
+                "label": f"{pool} {window_label(secs)}",
+                "pct": pct,
+                "resets_at": b.get(reset_key),
+                "secs": secs,
+                # 5 小時窗沒用過時重置時間永遠是「現在＋5 小時」；每週窗照常倒數（同 OpenUsage）
+                "not_started": pct == 0 and secs < 604800,
+            })
+        windows += sorted(pool_windows, key=lambda w: w["secs"])  # 短窗在上
+    return windows
 
-    回應結構：response.groups[]（Gemini 池、其他模型池）各有 buckets[]（window、remainingFraction、resetTime）。
+
+def fetch_antigravity_cli_quota():
+    """用 `agy -p /usage --output-format json` 查額度：agy 不必開著、不跑 agent、不花額度（agy 1.4.2 實測）。
+
+    agy 1.4.2 起本機服務要 CSRF token，而 CLI 的 token 只放在它自己開的子 shell 環境變數，外部讀不到，
+    所以改走這個官方的唯讀指令。找不到 agy 或失敗時回傳 None，由呼叫端改讀 App 的本機服務。
     """
+    agy = os.path.join(os.environ.get("LOCALAPPDATA", ""), "agy", "bin", "agy.exe")
+    if not os.path.isfile(agy):
+        agy = shutil.which("agy")
+    if not agy:
+        return None
+    try:
+        out = subprocess.run([agy, "-p", "/usage", "--output-format", "json"], capture_output=True,
+                             stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace", timeout=30).stdout
+        groups = ((json.loads(out).get("command") or {}).get("data") or {}).get("groups") or []
+    except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError):
+        return None
+    windows = antigravity_windows(groups, "name", "remaining_fraction", "reset_time")
+    return {"windows": windows} if windows else None
+
+
+def fetch_antigravity_quota():
+    """查 Antigravity 額度：先用 agy CLI 的 /usage；沒有 agy 時改讀執行中的 Antigravity App 本機服務。
+
+    本機服務回應結構：response.groups[]（Gemini 池、其他模型池）各有 buckets[]（window、remainingFraction、resetTime）。
+    """
+    cli = fetch_antigravity_cli_quota()
+    if cli:
+        return cli
     targets = find_antigravity_targets()
     if not targets:
-        return {"error": "Antigravity 沒有在執行（開著 Antigravity App 或 agy 才抓得到額度）"}
+        return {"error": "抓不到 Antigravity 額度（agy CLI 查詢失敗，也沒有執行中的 Antigravity App）"}
     ctx = ssl._create_unverified_context()  # 本機 loopback 自簽憑證，只對 127.0.0.1 略過驗證
     # 僅限連本機 127.0.0.1 的 Antigravity language server（自簽憑證）；不得把這個 context 用在任何對外連線。
     body = json.dumps({"metadata": {"ideName": "antigravity", "extensionName": "antigravity",
@@ -374,25 +426,7 @@ def fetch_antigravity_quota():
                 groups = (json.load(resp).get("response") or {}).get("groups") or []
         except (urllib.error.URLError, OSError, ValueError, AttributeError):
             continue
-        windows = []
-        for g in groups:
-            # 兩個池：Gemini Models、Claude and GPT models（名稱照 OpenUsage 簡稱）
-            pool = "Gemini" if re.search("gemini", g.get("displayName") or "", re.I) else "Claude/GPT"
-            pool_windows = []
-            for b in g.get("buckets") or []:
-                if b.get("remainingFraction") is None:
-                    continue
-                secs = {"weekly": 604800, "daily": 86400}.get(b.get("window"), 18000)
-                pct = round((1 - b["remainingFraction"]) * 100, 1)
-                pool_windows.append({
-                    "label": f"{pool} {window_label(secs)}",
-                    "pct": pct,
-                    "resets_at": b.get("resetTime"),
-                    "secs": secs,
-                    # 5 小時窗沒用過時重置時間永遠是「現在＋5 小時」；每週窗照常倒數（同 OpenUsage）
-                    "not_started": pct == 0 and secs < 604800,
-                })
-            windows += sorted(pool_windows, key=lambda w: w["secs"])  # 短窗在上
+        windows = antigravity_windows(groups, "displayName", "remainingFraction", "resetTime")
         if windows:
             return {"windows": windows}
     return {"error": "Antigravity 本機服務沒有回應額度資料"}
