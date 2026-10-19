@@ -181,7 +181,10 @@ def fetch_claude_quota():
     except (urllib.error.URLError, OSError, ValueError) as e:
         return {"error": f"額度 API 連線失敗：{e}"}
     windows = []
-    for key, label, secs in (("five_hour", "5 小時", 18000), ("seven_day", "每週", 604800)):
+    # 分模型的每週額度（seven_day_opus／seven_day_sonnet）只在有分開限制的方案才有值，Pro 方案目前是 null
+    # （2026-10-19 實測）；欄位一有值就自動多出額度條
+    for key, label, secs in (("five_hour", "5 小時", 18000), ("seven_day", "每週", 604800),
+                             ("seven_day_opus", "Opus 每週", 604800), ("seven_day_sonnet", "Sonnet 每週", 604800)):
         w = data.get(key) or {}
         if w.get("utilization") is None:
             continue
@@ -189,7 +192,15 @@ def fetch_claude_quota():
     if not windows:
         return {"error": "額度 API 回應中沒有 5 小時／每週額度資料"}
     return {"windows": windows, "grants": parse_claude_reset_grants(data.get("cedar_ember")),
+            "breakdown": parse_claude_breakdown(data.get("seven_day_breakdown")),
             "plan": fetch_claude_plan(headers, oauth.get("subscriptionType"), oauth.get("rateLimitTier"))}
+
+
+def parse_claude_breakdown(block):
+    """每週用量依用途分（Claude Code、Chats、Cowork…），percent 是佔本週用量的比例，不是佔額度。沒有資料回傳 None。"""
+    rows = [{"name": r.get("display_name") or r.get("key") or "?", "pct": r["percent"]}
+            for r in (block or {}).get("rows") or [] if isinstance(r.get("percent"), (int, float))]
+    return rows if any(r["pct"] > 0 for r in rows) else None
 
 
 def parse_claude_reset_grants(block):
@@ -240,6 +251,25 @@ def fetch_claude_plan(headers, stored_type, stored_tier):
     return format_claude_plan(f"claude_{stored_type}" if stored_type else None, stored_tier)
 
 
+def codex_windows(rl, prefix=None):
+    """把 Codex 的 rate_limit（primary_window／secondary_window）換成額度條；prefix 是分模型額度的名稱。"""
+    windows = []
+    for w in ((rl or {}).get("primary_window"), (rl or {}).get("secondary_window")):
+        if not isinstance(w, dict) or w.get("used_percent") is None:
+            continue
+        secs = w.get("limit_window_seconds") or 0
+        reset_at = w.get("reset_at")
+        windows.append({
+            "label": f"{prefix} {window_label(secs)}" if prefix else window_label(secs),
+            "pct": w["used_percent"],
+            "resets_at": datetime.datetime.fromtimestamp(reset_at, datetime.timezone.utc).isoformat() if reset_at else None,
+            "secs": secs,
+            # 窗還沒開始計時：API 回報的重置時間永遠是「現在＋整個窗長」
+            "not_started": w["used_percent"] == 0 and (w.get("reset_after_seconds") or 0) >= secs > 0,
+        })
+    return sorted(windows, key=lambda w: w["secs"])  # 短窗在上，跟 Claude 卡片同順序
+
+
 def fetch_codex_quota():
     """查 Codex（ChatGPT 方案）額度：token 取自 Codex CLI 的 ~/.codex/auth.json。
 
@@ -269,24 +299,14 @@ def fetch_codex_quota():
         return {"error": f"Codex 額度 API 回應 HTTP {e.code}"}
     except (urllib.error.URLError, OSError, ValueError) as e:
         return {"error": f"Codex 額度 API 連線失敗：{e}"}
-    rl = data.get("rate_limit") or {}
-    windows = []
-    for w in (rl.get("primary_window"), rl.get("secondary_window")):
-        if not w or w.get("used_percent") is None:
-            continue
-        secs = w.get("limit_window_seconds") or 0
-        reset_at = w.get("reset_at")
-        windows.append({
-            "label": window_label(secs),
-            "pct": w["used_percent"],
-            "resets_at": datetime.datetime.fromtimestamp(reset_at, datetime.timezone.utc).isoformat() if reset_at else None,
-            "secs": secs,
-            # 窗還沒開始計時：API 回報的重置時間永遠是「現在＋整個窗長」
-            "not_started": w["used_percent"] == 0 and (w.get("reset_after_seconds") or 0) >= secs > 0,
-        })
+    windows = codex_windows(data.get("rate_limit"))
     if not windows:
         return {"error": "Codex 額度 API 回應中沒有額度窗資料"}
-    windows.sort(key=lambda w: w["secs"])  # 短窗在上，跟 Claude 卡片同順序
+    # 個別模型的額外額度（additional_rate_limits）：目前 Plus 方案是 null（2026-10-19 實測），一有值就接在後面。
+    # 每筆的欄位（limit_name／metered_feature／rate_limit）照 Codex CLI 原始碼的結構寫，尚未看過實際資料，未查證
+    for extra in data.get("additional_rate_limits") or []:
+        if isinstance(extra, dict):
+            windows += codex_windows(extra.get("rate_limit"), extra.get("limit_name") or extra.get("metered_feature"))
     plan = data.get("plan_type")
     # 額度重置券：API 只給張數、沒有每張的期限，所以只顯示張數（沒有 items 就不出現滑鼠提示）
     credits = data.get("rate_limit_reset_credits")
@@ -1057,9 +1077,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     .stack {
       max-width: none; display: grid; gap: 12px; align-items: stretch;
       grid-template-columns: minmax(0, 1.25fr) repeat(3, minmax(0, 1fr));
-      grid-template-rows: 1fr auto; min-height: calc(100vh - 16px);
+      /* 前四列給工具卡片的標題／額度區／趨勢圖／花費區共用（subgrid），三張卡各區塊起點對齊；最後一列是頁尾 */
+      grid-template-rows: auto auto 1fr auto auto; min-height: calc(100vh - 16px);
     }
     .footer { grid-column: 1 / -1; padding: 0; }
+    #spendCard { grid-row: 1 / span 4; }
+    #providerCards .card { display: grid; grid-row: 1 / span 4; grid-template-rows: subgrid; row-gap: 0; }
     .card { display: flex; flex-direction: column; padding: 12px 14px 10px; }
     .card-head, .prov-head { margin-bottom: 8px; }
     .tabs { margin-bottom: 10px; }
@@ -1076,8 +1099,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     .token-list { gap: 6px; }
     .trend { flex: 1; display: flex; flex-direction: column; min-height: 44px; max-height: 160px; margin-bottom: 8px; }
     .trend svg { flex: 1; height: auto; min-height: 24px; }
-    .card > .expand { margin-top: auto; }  /* 趨勢圖到頂後多出的空間放在花費區上方，各卡花費區貼底對齊 */
-    .expand .spend-row { font-size: 14px; padding: 5px 6px; }
+    #spendCard > .expand { margin-top: auto; }  /* 總花費卡：多出的空間放在明細上方，明細貼底 */    .expand .spend-row { font-size: 14px; padding: 5px 6px; }
     .expand .sub-title { font-size: 12px; }
     #spendCard .donut-row { flex: 1; min-height: 120px; gap: 14px; }
     #spendCard .donut-wrap { width: clamp(110px, 24vh, 190px); height: clamp(110px, 24vh, 190px); }
@@ -1332,6 +1354,8 @@ function renderMeters(el, p) {
     note.textContent = q.note;
     el.appendChild(note);
   }
+  // 每週用途、額度重置券跟額度有關，放在額度條下面（寬螢幕時這裡本來就有被 Antigravity 撐出的空白）
+  el.insertAdjacentHTML("beforeend", breakdownHtml(p) + grantsHtml(p));
 }
 
 // ---------- 每家卡片 ----------
@@ -1396,6 +1420,19 @@ function grantsHtml(p) {
     <span class="row-nums${g.count ? "" : " nodata"}">${g.count} 張可用</span>${pop}</div></div>`;
 }
 
+// 每週用途（Claude 才有）：直接列出有用量的用途，滑鼠移上看全部用途的比例條；比例是佔本週用量，不是佔額度
+function breakdownHtml(p) {
+  const rows = p.quota && p.quota.breakdown;
+  if (!rows) return "";
+  const used = rows.filter(r => r.pct > 0).sort((a, b) => b.pct - a.pct);
+  const pop = `<div class="popover">` + rows.map(r => `<div class="pm">
+      <div class="pm-line"><span class="pm-name">${esc(r.name)}</span><span>${Math.round(r.pct)}%</span></div>
+      <div class="track"><div class="seg" style="width:${Math.min(100, r.pct)}%;background:#9AA0AC"></div></div></div>`).join("") +
+    `<div class="pm-sub">佔本週用量的比例，不是佔額度</div></div>`;
+  return `<div class="grants"><div class="spend-row has-models"><span class="row-name">每週用途</span>
+    <span class="row-nums">${used.map(r => `${esc(r.name)} ${Math.round(r.pct)}%`).join(" · ")}</span>${pop}</div></div>`;
+}
+
 const meterEls = [];
 function renderProviders() {
   const wrap = document.getElementById("providerCards");
@@ -1410,7 +1447,7 @@ function renderProviders() {
       <button class="caret" data-expand="prov${i}"><span>顯示更多</span><span class="chev">▾</span></button>
       <div class="expand" data-panel="prov${i}">
         <div class="sub-title" title="用本機紀錄的 token 數乘上官方 API 單價估算，不是實際帳單；滑鼠移到數字上看分模型明細">花費（估算，移上看分模型）</div>
-        ${spendRowsHtml(p)}${grantsHtml(p)}
+        ${spendRowsHtml(p)}
       </div>`;
     wrap.appendChild(card);
     meterEls.push([card.querySelector(".meters"), p]);
