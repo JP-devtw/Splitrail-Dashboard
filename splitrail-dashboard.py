@@ -531,6 +531,10 @@ GEMINI_PRICES = {
     "gemini-3.6-flash": [(datetime.date(2026, 12, 31), (0.75, 3.75, 0.075)), (None, (1.5, 7.5, 0.15))],
     "gemini-3.5-flash": [(None, (1.5, 9.0, 0.15))],
     "gemini-3.1-pro": [(None, (2.0, 12.0, 0.2))],
+    # Gemini 4（2026-11-16 核對 aistudio.google.com/docs/pricing）：Argon 2026-12-01 起漲價；Hydrogen 無日期變動。
+    # Antigravity 紀錄裡的 gemini-4-argon-trial 沒有官方單價，比照 gemini-4-argon 計（推定）。
+    "gemini-4-argon": [(datetime.date(2026, 11, 30), (2.0, 10.0, 0.1)), (None, (4.0, 20.0, 0.2))],
+    "gemini-4-hydrogen": [(None, (1.5, 7.5, 0.075))],
 }
 GEMINI_PRO_LONG_PROMPT = (200_000, (4.0, 18.0, 0.4))
 
@@ -582,6 +586,9 @@ def gemini_canonical(model_id, label):
         return f"gemini-{m.group(1)}-flash"
     if re.match(r"(?i)^Gemini 3\.1 Pro\b", label or ""):
         return "gemini-3.1-pro"
+    m = re.match(r"(?i)^Gemini 4 (Argon|Hydrogen)\b", label or "") or re.match(r"^gemini-4-(argon|hydrogen)\b", model_id or "")
+    if m:
+        return f"gemini-4-{m.group(1).lower()}"
     m = re.match(r"^gemini-(3\.[5-8])-flash\b", model_id or "")
     if m:
         return f"gemini-{m.group(1)}-flash"
@@ -689,6 +696,10 @@ def scan_antigravity_daily():
 # fast（原 priority，2026-07-30 改名）倍率：gpt-6-astra 官方頁寫 2 倍；gpt-5.5 2.5 倍、5.6 系列 2 倍取自
 # OpenUsage／CrossUsage 的對照表（5.6 系列官方頁未寫，未查證）。
 CODEX_PRICES = {
+    # gpt-6 系列（2026-11-16 核對官方模型頁；長 context 依頁面「input／cache 2 倍、output 1.5 倍」換算，fast 2 倍）
+    "gpt-6-sol": (2.0, 0.2, 10.0, (4.0, 0.4, 15.0), 2.0),
+    "gpt-6.1-sol": (2.0, 0.1, 10.0, (4.0, 0.2, 15.0), 2.0),
+    "gpt-6.1-terra": (1.0, 0.05, 5.0, (2.0, 0.1, 7.5), 2.0),
     "gpt-6-astra": (10.0, 1.0, 50.0, (20.0, 2.0, 75.0), 2.0),
     "gpt-5.6-sol": (5.0, 0.5, 30.0, (10.0, 1.0, 45.0), 2.0),
     "gpt-5.6-terra": (2.0, 0.2, 12.0, (4.0, 0.4, 18.0), 2.0),
@@ -865,6 +876,35 @@ def scan_codex_daily():
         m = d["model_stats"][model]
         m["cost"] = m.get("cost", 0) + cost
     return daily, conversations
+
+
+# splitrail 3.10.1 沒有單價、花費記為 0 的 Claude 模型，由這裡補算。
+# 美元／每百萬 token：(input, output, cache read)；cache 寫入照 splitrail 對 Opus 5.5 的算法用 input 的 1.25 倍（5 分鐘快取價）。
+# 來源：claude-api skill 模型表（快取日 2026-11-03，2026-11-16 核對）。Haiku 5.5 的 cache read 表上沒寫，
+# 照一般 0.1 倍推定；Haiku 單次提示超過 100K 的較高單價無法從每日彙總判斷，一律用一般單價。
+CLAUDE_FALLBACK_PRICES = {
+    "claude-fable-5-2": (8.0, 40.0, 0.2),
+    "claude-sonnet-5-5": (2.0, 10.0, 0.1),
+    "claude-haiku-5-5": (0.1, 0.5, 0.01),
+}
+
+
+def fill_claude_costs(data):
+    """把 splitrail 算成 0 的 Claude 模型花費補上（splitrail 有算的不動）。"""
+    for a in data.get("analyzer_stats", []):
+        if a.get("analyzer_name") != "Claude Code":
+            continue
+        for day in (a.get("daily_stats") or {}).values():
+            for name, m in (day.get("model_stats") or {}).items():
+                price = CLAUDE_FALLBACK_PRICES.get(name)
+                if not price or m.get("cost"):
+                    continue
+                rin, rout, rread = price
+                cost = (m.get("inputTokens", 0) * rin + m.get("outputTokens", 0) * rout
+                        + m.get("cacheCreationTokens", 0) * rin * 1.25 + m.get("cacheReadTokens", 0) * rread) / 1_000_000
+                m["cost"] = cost
+                stats = day.setdefault("stats", {})
+                stats["costCents"] = stats.get("costCents", 0) + cost * 100
 
 
 def replace_analyzer_daily(data, name, daily, conversations):
@@ -1497,6 +1537,7 @@ def generate(want_html, out_path, open_browser, stamp=None):
         codex_job = pool.submit(scan_codex_daily)
         quota_jobs = {name: pool.submit(f) for name, f in QUOTA_FETCHERS.items()} if want_html else {}
         data = splitrail_job.result()  # splitrail 失敗時的 sys.exit 會在這裡重新拋出，行為同以前
+        fill_claude_costs(data)
         replace_analyzer_daily(data, "Antigravity CLI", *antigravity_job.result())
         replace_analyzer_daily(data, "Codex CLI", *codex_job.result())
         quotas = {name: job.result() for name, job in quota_jobs.items()}
